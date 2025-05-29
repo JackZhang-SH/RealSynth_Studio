@@ -1,0 +1,11 @@
+name: blender_py39
+dependencies:
+  - python=3.9
+  - pip
+  - numpy
+  - imageio
+  - opencv
+  - tqdm
+  - matplotlib
+  - pip:
+      - fake-bpy-module-4.0
