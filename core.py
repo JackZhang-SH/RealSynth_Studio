@@ -1,15 +1,27 @@
 # core.py
 """
-Core implementation: view-point sampling, per-frame rendering, and metadata
-export.  Provides an *incremental* generator so the UI can refresh after every
-single image render.
+Core implementation: multi‑camera dataset generator for Blender.
 
 Key classes
 -----------
-SamplingStrategy                – abstract camera-position sampler
+SamplingStrategy                – abstract camera‑position sampler
 FibonacciSphereSampling         – default uniform sphere sampling
-FrameDatasetRenderer            – renders one frame (many camera views)
+CameraRig                       – creates/maintains one camera per sample
+FrameDatasetRenderer            – renders one frame using the rig
 DatasetGenerator                – drives multiple frames incrementally
+
+2025‑05‑30  (multi‑camera refactor)
+----------------------------------
+* Each sample position is represented by **its own** camera object (``camera
+  {id}``) that persists across frames.  This emulates a real‑world rig where
+  many cameras capture simultaneously.
+* The original logic that teleported a single camera has been retired.
+* A future feature may let users pick a subset of cameras (e.g. for a test
+  split).  The design already stores the full ``self.cameras`` list in
+  ``DatasetGenerator`` so filtering can be implemented later without major
+  refactoring.
+
+All identifiers + comments are English‑only per project guidelines.
 """
 from __future__ import annotations
 
@@ -23,12 +35,11 @@ import bpy
 import bpy.path as bpath
 from mathutils import Vector
 
-
 # --------------------------------------------------------------------------- #
 # Sampling
 # --------------------------------------------------------------------------- #
 class SamplingStrategy(ABC):
-    """Interface for producing n camera positions on a sphere of given radius."""
+    """Interface for producing *n* camera positions on a sphere of *radius*."""
 
     @abstractmethod
     def sample(self, n: int, radius: float) -> Sequence[Vector]:
@@ -50,40 +61,102 @@ class FibonacciSphereSampling(SamplingStrategy):
             pts.append(Vector((x, y, z)) * radius)
         return pts
 
+class FibonacciHemisphereSampling(FibonacciSphereSampling):
+    """Fibonacci spiral constrained to the *upper* hemisphere (z ≥ 0)."""
+
+    def sample(self, n: int, radius: float) -> List[Vector]:          # type: ignore[override]
+        pts: List[Vector] = []
+        i = 0
+        while len(pts) < n:
+            z = 1.0 - (2 * i + 1) / (2 * n)          # step twice as fine
+            if z >= 0:
+                theta = self._golden_angle * i
+                r_xy = math.sqrt(max(0.0, 1.0 - z * z))
+                x, y = r_xy * math.cos(theta), r_xy * math.sin(theta)
+                pts.append(Vector((x, y, z)) * radius)
+            i += 1
+        return pts
 
 # --------------------------------------------------------------------------- #
-# Single-frame renderer  (incremental)
+# Camera rig helper
 # --------------------------------------------------------------------------- #
-class FrameDatasetRenderer:
-    """Render a single timeline frame from many camera positions."""
+class CameraRig:
+    """Maintain one Blender camera per sample position.
+
+    The first camera re‑uses the *template* camera supplied by the user.  All
+    additional cameras are *duplicates* of that template so optical parameters
+    (lens, sensor size, etc.) remain identical.
+    """
 
     def __init__(
         self,
-        frame_idx: int,
-        camera: bpy.types.Object,
-        strategy: SamplingStrategy,
-        images_per_frame: int,
+        template_camera: bpy.types.Object,
+        positions: Sequence[Vector],
         target: Vector,
-        radius: float,
+        base_name: str = "camera",
     ) -> None:
-        self.frame_idx = frame_idx
-        self.camera = camera
-        self.strategy = strategy
-        self.images_per_frame = images_per_frame
-        self.target = target
-        self.radius = radius
+        if template_camera.type != "CAMERA":
+            raise TypeError("template_camera must be a CAMERA object")
 
-        self._frames_meta: list[dict] = []
+        self.cameras: List[bpy.types.Object] = []
+
+        # Ensure we are operating in object mode for safe ops
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        # Use the template itself as camera 0 --------------------------------
+        cam0 = template_camera
+        cam0.name = f"{base_name} 0"
+        self._place_camera(cam0, positions[0], target)
+        self.cameras.append(cam0)
+
+        # Duplicate for remaining positions ---------------------------------
+        for idx, pos in enumerate(positions[1:], start=1):
+            name = f"{base_name} {idx}"
+            cam_obj = bpy.data.objects.get(name)
+            if cam_obj is None:  # create new duplicate only if not present
+                cam_obj = self._duplicate_camera(cam0, name)
+            self._place_camera(cam_obj, pos, target)
+            self.cameras.append(cam_obj)
+
+    # ---------------------------------- helpers --------------------------- #
+    @staticmethod
+    def _duplicate_camera(source: bpy.types.Object, name: str) -> bpy.types.Object:
+        """Deep‑copy *source* camera (including its data block) and link it."""
+        dup_obj = source.copy()
+        dup_obj.data = source.data.copy()
+        dup_obj.name = name
+        bpy.context.collection.objects.link(dup_obj)
+        return dup_obj
+
+    @staticmethod
+    def _place_camera(cam: bpy.types.Object, position: Vector, target: Vector) -> None:
+        """Set *cam* to *position* and orient it to look at *target*."""
+        cam.location = position
+        direction = target - cam.location
+        cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+
+    # Allow ``for cam in rig: ...``
+    def __iter__(self):
+        return iter(self.cameras)
+
+
+# --------------------------------------------------------------------------- #
+# Single‑frame renderer (incremental)
+# --------------------------------------------------------------------------- #
+class FrameDatasetRenderer:
+    """Render **one** Blender timeline frame using a fixed camera rig."""
+
+    def __init__(self, frame_idx: int, cameras: Sequence[bpy.types.Object]):
+        self.frame_idx = frame_idx
+        self.cameras = list(cameras)
+        self._frames_meta: List[dict] = []
 
     # --------------------------------------------------------------------- #
     # Public: incremental generator
     # --------------------------------------------------------------------- #
     def iter_render(self, root_out: Path) -> Iterator[None]:
-        """
-        Render **one image**, yield control, repeat.  After the last image,
-        transforms.json is written.  Yields `None` after *each* image so
-        external callers can update the UI.
-        """
+        """Render one image at a time and yield control after each."""
         scene = bpy.context.scene
         scene.frame_set(self.frame_idx)
 
@@ -91,11 +164,8 @@ class FrameDatasetRenderer:
         train_dir = frame_dir / "train"
         train_dir.mkdir(parents=True, exist_ok=True)
 
-        positions = self.strategy.sample(self.images_per_frame, self.radius)
-
-        for view_idx, pos in enumerate(positions):
-            # -- position + orient camera ---------------------------------- #
-            self._set_camera(pos)
+        for view_idx, cam in enumerate(self.cameras):
+            scene.camera = cam
             scene.render.filepath = str(train_dir / f"render_{view_idx:04d}.png")
 
             # -- render just one image ------------------------------------- #
@@ -105,9 +175,7 @@ class FrameDatasetRenderer:
             self._frames_meta.append(
                 {
                     "file_path": f"train/render_{view_idx:04d}.png",
-                    "transform_matrix": self._matrix_to_list(
-                        self.camera.matrix_world
-                    ),
+                    "transform_matrix": self._matrix_to_list(cam.matrix_world),
                 }
             )
 
@@ -119,20 +187,14 @@ class FrameDatasetRenderer:
     # --------------------------------------------------------------------- #
     # Helpers
     # --------------------------------------------------------------------- #
-    def _set_camera(self, position: Vector) -> None:
-        """Move camera to *position* and turn it to look at *target*."""
-        self.camera.location = position
-        direction = self.target - self.camera.location
-        self.camera.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
-
     @staticmethod
     def _matrix_to_list(mat) -> List[List[float]]:
         return [list(row) for row in mat]
 
     def _write_transforms_json(self, frame_dir: Path) -> None:
-        """Write NeRF-style transforms.json using collected frame metadata."""
+        """Write NeRF‑style transforms.json using collected frame metadata."""
+        cam = self.cameras[0].data  # all cameras share identical intrinsics
         scene = bpy.context.scene
-        cam = self.camera.data
 
         scale = scene.render.resolution_percentage / 100.0
         width = scene.render.resolution_x * scale
@@ -158,10 +220,10 @@ class FrameDatasetRenderer:
 
 
 # --------------------------------------------------------------------------- #
-# Multi-frame driver   (also incremental)
+# Multi‑frame driver (also incremental)
 # --------------------------------------------------------------------------- #
 class DatasetGenerator:
-    """High-level driver that iterates over Blender timeline frames."""
+    """High‑level driver that iterates over timeline frames with a camera rig."""
 
     def __init__(
         self,
@@ -173,37 +235,32 @@ class DatasetGenerator:
         target: Tuple[float, float, float] | Vector = (0.0, 0.0, 0.0),
         sampling: SamplingStrategy | None = None,
     ) -> None:
-        cam_obj = bpy.data.objects.get(camera_name)
-        if cam_obj is None or cam_obj.type != "CAMERA":
+        template_cam = bpy.data.objects.get(camera_name)
+        if template_cam is None or template_cam.type != "CAMERA":
             raise ValueError(f"No camera named {camera_name!r} found")
-        self.camera = cam_obj
 
         self.start = start_frame
         self.end = end_frame
-        self.images_per_frame = images_per_frame
-        self.radius = radius
         self.target = Vector(target)
         self.strategy = sampling or FibonacciSphereSampling()
+
+        # Build the camera rig ------------------------------------------------
+        positions = self.strategy.sample(images_per_frame, radius)
+        self.rig = CameraRig(template_cam, positions, self.target)
+        self.cameras = self.rig.cameras  # future filtering can happen here
 
     # --------------------------------------------------------------------- #
     # Properties
     # --------------------------------------------------------------------- #
     @property
     def total_images(self) -> int:  # total work units
-        return (self.end - self.start + 1) * self.images_per_frame
+        return (self.end - self.start + 1) * len(self.cameras)
 
     # --------------------------------------------------------------------- #
     # Public incremental generator
     # --------------------------------------------------------------------- #
     def iter_generate(self, output_dir: str | Path) -> Iterator[Tuple[int, int]]:
-        """
-        Incrementally generate the whole dataset.
-
-        Yields
-        ------
-        (done, total) : Tuple[int,int]
-            *done* images rendered so far and *total* images in the batch.
-        """
+        """Incrementally generate the whole dataset."""
         root_out = Path(bpath.abspath(str(output_dir))).resolve()
         root_out.mkdir(parents=True, exist_ok=True)
 
@@ -211,14 +268,7 @@ class DatasetGenerator:
         total = self.total_images
 
         for frame_idx in range(self.start, self.end + 1):
-            renderer = FrameDatasetRenderer(
-                frame_idx=frame_idx,
-                camera=self.camera,
-                strategy=self.strategy,
-                images_per_frame=self.images_per_frame,
-                target=self.target,
-                radius=self.radius,
-            )
+            renderer = FrameDatasetRenderer(frame_idx=frame_idx, cameras=self.cameras)
             for _ in renderer.iter_render(root_out):
                 done += 1
                 yield done, total  # report progress on every single image

@@ -38,9 +38,19 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
     start_frame: bpy.props.IntProperty(name="Start Frame", min=1, default=1)  # type: ignore
     end_frame: bpy.props.IntProperty(name="End Frame", min=1, default=1)  # type: ignore
 
-    images_per_frame: bpy.props.IntProperty(  # type: ignore
-        name="Images per Frame", min=1, default=60
+    images_per_frame: bpy.props.IntProperty(   # type: ignore
+        name="Camera Count", min=1, default=60
     )
+    sampling_strategy: bpy.props.EnumProperty(
+        name="Sampling Strategy",
+        items=[
+            ("HEMI", "Fibonacci (Upper-Hemisphere)",
+             "Uniformly sample cameras on z ≥ 0"),
+            ("SPHERE", "Fibonacci (Full-Sphere)",
+             "Uniformly sample the entire sphere"),
+        ],
+        default="HEMI",
+    )  # type: ignore
     radius: bpy.props.FloatProperty(name="Sphere Radius", min=0.1, default=10.0)  # type: ignore
     target_point: bpy.props.FloatVectorProperty(  # type: ignore
         name="Target Point", subtype="TRANSLATION", default=(0.0, 0.0, 0.0)
@@ -52,7 +62,74 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
     is_running: bpy.props.BoolProperty(  # type: ignore
         name="Generating", default=False
     )
+    cameras_generated: bpy.props.BoolProperty(      # 已生成 rig？
+        name="Cameras Generated", default=False
+    ) # type: ignore
 
+    camera_source: bpy.props.EnumProperty(
+        name="Camera Source",
+        items=[
+            ("DEFAULT", "Default Camera",
+             "Use Blender default camera as template"),
+            ("IMPORT",  "Import JSON",
+             "Load intrinsic & extrinsic from external json (coming soon)"),
+        ],
+        default="DEFAULT",
+    ) # type: ignore
+
+# --------------------------------------------------------------------------- #
+# Camera-rig operators
+# --------------------------------------------------------------------------- #
+class RS_OT_GenerateCameras(bpy.types.Operator):
+    bl_idname = "rs.generate_cameras"
+    bl_label  = "Generate Cameras"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        s = context.scene.rs_settings
+
+        # ---------- 仅实现 DEFAULT，IMPORT 作占位 ----------
+        if s.camera_source != "DEFAULT":
+            self.report({'INFO'}, "JSON import not implemented yet")
+            return {'CANCELLED'}
+
+        # 若已存在任何 camera，则先调用清空逻辑，保持单一来源
+        bpy.ops.rs.clear_cameras()
+
+        # 保证有“默认摄像机”可用；若场景无 active camera 就新建
+        if context.scene.camera is None:
+            cam_data = bpy.data.cameras.new("DefaultCam")
+            cam_obj  = bpy.data.objects.new("DefaultCam", cam_data)
+            context.collection.objects.link(cam_obj)
+            context.scene.camera = cam_obj
+
+        # 采样并生成 rig（沿用 core.CameraRig）
+        from .core import CameraRig, FibonacciSphereSampling
+        template = context.scene.camera
+        if s.sampling_strategy == "HEMI":
+            from .core import FibonacciHemisphereSampling as Sampler
+        else:
+            from .core import FibonacciSphereSampling as Sampler
+        positions = Sampler().sample(s.images_per_frame, s.radius)
+        CameraRig(template, positions, Vector(s.target_point))
+
+        s.cameras_generated = True
+        self.report({'INFO'}, f"{len(positions)} cameras created")
+        return {'FINISHED'}
+
+
+class RS_OT_ClearCameras(bpy.types.Operator):
+    bl_idname = "rs.clear_cameras"
+    bl_label  = "Clear Cameras"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        cams = [o for o in bpy.data.objects if o.type == 'CAMERA']
+        for o in cams:
+            bpy.data.objects.remove(o, do_unlink=True)
+        context.scene.rs_settings.cameras_generated = False
+        self.report({'INFO'}, "All cameras removed")
+        return {'FINISHED'}
 
 # --------------------------------------------------------------------------- #
 # Generate-dataset modal operator
@@ -82,6 +159,9 @@ class RS_OT_GenerateDataset(bpy.types.Operator):
 
         s = context.scene.rs_settings
         wm = context.window_manager
+        if not s.cameras_generated:
+            self.report({'ERROR'}, "Generate cameras first (button above)")
+            return {"CANCELLED"}
 
         # build generator -------------------------------------------------- #
         generator = DatasetGenerator(
@@ -190,4 +270,4 @@ class RS_OT_CancelGeneration(bpy.types.Operator):
 # --------------------------------------------------------------------------- #
 # Class list for registration
 # --------------------------------------------------------------------------- #
-CLASSES = [RSDatasetSettings, RS_OT_GenerateDataset, RS_OT_CancelGeneration]
+CLASSES = [RSDatasetSettings, RS_OT_GenerateDataset, RS_OT_CancelGeneration,    RS_OT_GenerateCameras,  RS_OT_ClearCameras]
