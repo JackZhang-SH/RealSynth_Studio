@@ -223,37 +223,26 @@ class FrameDatasetRenderer:
 # Multi‑frame driver (also incremental)
 # --------------------------------------------------------------------------- #
 class DatasetGenerator:
-    """High‑level driver that iterates over timeline frames with a camera rig."""
+    """Drive timeline frames using *existing* RS Studio cameras."""
 
     def __init__(
         self,
-        camera_name: str,
+        cameras: Sequence[bpy.types.Object],
         start_frame: int,
         end_frame: int,
-        images_per_frame: int,
-        radius: float,
-        target: Tuple[float, float, float] | Vector = (0.0, 0.0, 0.0),
-        sampling: SamplingStrategy | None = None,
     ) -> None:
-        template_cam = bpy.data.objects.get(camera_name)
-        if template_cam is None or template_cam.type != "CAMERA":
-            raise ValueError(f"No camera named {camera_name!r} found")
+        if not cameras:
+            raise ValueError("No RS Studio cameras supplied")
 
+        self.cameras = list(cameras)
         self.start = start_frame
         self.end = end_frame
-        self.target = Vector(target)
-        self.strategy = sampling or FibonacciSphereSampling()
-
-        # Build the camera rig ------------------------------------------------
-        positions = self.strategy.sample(images_per_frame, radius)
-        self.rig = CameraRig(template_cam, positions, self.target)
-        self.cameras = self.rig.cameras  # future filtering can happen here
 
     # --------------------------------------------------------------------- #
     # Properties
     # --------------------------------------------------------------------- #
     @property
-    def total_images(self) -> int:  # total work units
+    def total_images(self) -> int:
         return (self.end - self.start + 1) * len(self.cameras)
 
     # --------------------------------------------------------------------- #
@@ -264,11 +253,10 @@ class DatasetGenerator:
         root_out = Path(bpath.abspath(str(output_dir))).resolve()
         root_out.mkdir(parents=True, exist_ok=True)
 
-        done = 0
-        total = self.total_images
+        done, total = 0, self.total_images
 
         for frame_idx in range(self.start, self.end + 1):
             renderer = FrameDatasetRenderer(frame_idx=frame_idx, cameras=self.cameras)
             for _ in renderer.iter_render(root_out):
                 done += 1
-                yield done, total  # report progress on every single image
+                yield done, total
