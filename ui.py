@@ -27,9 +27,9 @@ class RS_PT_MainPanel(bpy.types.Panel):
         cam_box = layout.box()
         cam_box.label(text="Camera Rig", icon='CAMERA_DATA')
         cam_box.prop(s, "images_per_frame")
+        cam_box.prop(s, "sampling_strategy")
         cam_box.prop(s, "radius")
         cam_box.prop(s, "target_point")
-        cam_box.prop(s, "sampling_strategy")
         cam_box.prop(s, "camera_source", text="Source")
 
         row = cam_box.row(align=True)
@@ -55,6 +55,9 @@ class RS_PT_MainPanel(bpy.types.Panel):
         ds_box.prop(s, "output_dir")
         ds_box.prop(s, "start_frame")
         ds_box.prop(s, "end_frame")
+        ds_box.prop(s, "export_format", text="Format")
+        if s.export_format == "NGP":               # ★ 仅 NGP 时显示
+            ds_box.prop(s, "aabb_scale")
         if s.is_running:
             if hasattr(ds_box, "progress"):
                 ds_box.progress(

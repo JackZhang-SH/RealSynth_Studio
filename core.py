@@ -24,16 +24,531 @@ DatasetGenerator                – drives multiple frames incrementally
 All identifiers + comments are English‑only per project guidelines.
 """
 from __future__ import annotations
-
+import shutil
+from ast import Dict, Set
 import json
 import math
 from abc import ABC, abstractmethod
+import os
 from pathlib import Path
 from typing import Iterator, List, Sequence, Tuple
 
 import bpy
 import bpy.path as bpath
 from mathutils import Vector
+from enum import Enum, auto
+
+# ──────────────────────────────────────────────────────────── #
+#  New: export-format enumeration
+# ──────────────────────────────────────────────────────────── #
+class ExportFormat(Enum):
+    NGP          = auto()
+    NERF_SYNTH   = auto()
+    TACV         = auto()          # Time-Archival Camera Virtualisation
+    COLMAP_POSES = auto()      # ----- COLMAP (poses-only) ----
+    COLMAP_3DGS  = auto()   
+# ──────────────────────────────────────────────────────────── #
+#  New: abstract writer & concrete NGP / NeRF-Synthetic writer
+# ──────────────────────────────────────────────────────────── #
+class DatasetWriter(ABC):
+    """Strategy object that decides *where* each rendered PNG lands and
+    eventually writes one (or many) transforms-*.json."""
+
+    def __init__(self, root_out: Path, cam0: bpy.types.Camera) -> None:
+        self.root = root_out
+        self.cam0 = cam0               # all cameras share intrinsics
+        self._scene = bpy.context.scene
+
+        scale  = self._scene.render.resolution_percentage / 100.0
+        self.w = int(round(self._scene.render.resolution_x * scale))
+        self.h = int(round(self._scene.render.resolution_y * scale))
+        self.fx = cam0.lens / cam0.sensor_width * self.w
+
+    # --------- public API every subclass must offer --------- #
+    @abstractmethod
+    def filepath_for(self, cam_obj: bpy.types.Object, global_idx: int) -> Path:
+        ...
+
+    @abstractmethod
+    def register_frame(
+        self, cam_obj: bpy.types.Object, rel_path: str
+    ) -> None:
+        ...
+
+    @abstractmethod
+    def finish(self) -> None:         # called once after all frames done
+        ...
+    # 额外步数（供进度条预估）；渲染张数外的附加步骤写在这里
+    @property
+    def extra_steps(self) -> int:
+        return 0
+
+    # 若子类需要耗时后处理（例如调用 COLMAP），实现为生成器并在其中 yield
+    def postprocess_iter(self) -> Iterator[None]:
+        if False:
+            yield None
+
+# ---------- Instant-NGP (unchanged behaviour) --------------- #
+class NGPDatasetWriter(DatasetWriter):
+    def __init__(self, root_out: Path, cam0: bpy.types.Camera) -> None:
+        super().__init__(root_out, cam0)
+        self._per_frame_meta: dict[int, list] = {}
+
+    def filepath_for(self, cam_obj, global_idx):
+        frame = self._scene.frame_current
+        frame_dir = self.root / f"frame_{frame}" / "train"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        return frame_dir / f"render_{global_idx:04d}.png"
+
+    def register_frame(self, cam_obj, rel_path):
+        frame = self._scene.frame_current
+        # 把前缀 "frame_{idx}/" 剥掉，保证相对路径正确
+        prefix = f"frame_{frame}/"
+        local_fp = rel_path[len(prefix):] if rel_path.startswith(prefix) else rel_path
+        if not local_fp.startswith("./"):
+            local_fp = "./" + local_fp            # → "./train/render_0000.png"
+
+        self._per_frame_meta.setdefault(frame, []).append({
+            "file_path":        local_fp,
+            "transform_matrix": self._matrix(cam_obj.matrix_world),
+        })
+
+
+    def finish(self):
+        rs = bpy.context.scene.rs_settings
+        aabb = getattr(rs, "aabb_scale", 2)        # 用户可在 UI 里设
+
+        # 若相机 data 上没有这些自定义属性就自动填 0
+        dist = {k: float(self.cam0.get(k, 0.0)) for k in ("k1","k2","p1","p2")}
+        fx = 0.5 * self.w / math.tan(self.cam0.angle_x * 0.5)
+        fy = 0.5 * self.h / math.tan(self.cam0.angle_y * 0.5)
+        for frame, frames_meta in self._per_frame_meta.items():
+            out = {
+                "camera_angle_x": self.cam0.angle_x,
+                "camera_angle_y": self.cam0.angle_y,
+                "fl_x": fx, "fl_y": fy,
+                **dist,                         # k1 k2 p1 p2
+                "cx":   self.w * 0.5,
+                "cy":   self.h * 0.5,
+                "w": self.w, "h": self.h,
+                "aabb_scale": aabb,            # ★ 新增
+                "frames": frames_meta,
+            }
+            (self.root / f"frame_{frame}" / "transforms.json").write_text(
+                json.dumps(out, indent=4)
+            )
+
+    @staticmethod
+    def _matrix(mat): return [list(r) for r in mat]
+
+    
+# ---------- NeRF-Synthetic writer --------------------------- #
+_SPLIT_MAP = {"train": "train", "valid": "val", "test": "test"}
+
+class NeRFSyntheticWriter(DatasetWriter):
+    def __init__(self, root_out: Path, cam0):
+        super().__init__(root_out, cam0)
+        # frame  -> split -> running idx
+        self._seq:    dict[int, dict[str, int]]   = {}
+        # frame  -> split -> list[dict]
+        self._frames: dict[int, dict[str, list]]  = {}
+
+    # ---------- helpers -------------------------------------------------- #
+    def _split_of(self, cam_obj: bpy.types.Object) -> str:
+        for suf in _SPLIT_MAP:
+            if cam_obj.name.endswith(f"_{suf}"):
+                return suf
+        return "train"
+
+    # ---------- public API ------------------------------------------------ #
+    def filepath_for(self, cam_obj, _):
+        frame  = self._scene.frame_current
+        split  = self._split_of(cam_obj)               # 'train' | 'valid' | 'test'
+
+        # 递增序号
+        self._seq.setdefault(frame, {}).setdefault(split, 0)
+        idx = self._seq[frame][split]
+        self._seq[frame][split] += 1
+
+        frame_dir = self.root / f"frame_{frame}" / _SPLIT_MAP[split]
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        return frame_dir / f"r_{idx}.png"
+
+    def register_frame(self, cam_obj, rel_path):
+        frame  = self._scene.frame_current
+        split  = self._split_of(cam_obj)
+        prefix = f"frame_{frame}/"
+        local_fp = rel_path[len(prefix):] if rel_path.startswith(prefix) else rel_path
+        if not local_fp.startswith("./"):
+            local_fp = "./" + local_fp
+
+        self._frames.setdefault(frame, {}).setdefault(split, []).append({
+            "file_path":        local_fp,
+            "rotation":         math.pi / 100.0,
+            "transform_matrix": self._matrix(cam_obj.matrix_world),
+        })
+
+    def finish(self):
+        common = {
+            "camera_angle_x": self.cam0.angle_x,
+            "camera_angle_y": self.cam0.angle_y,
+            "fl_x": self.fx, "fl_y": self.fx,
+            "cx":  self.w * 0.5, "cy": self.h * 0.5,
+            "w":   self.w,       "h":  self.h,
+        }
+
+        for frame, split_dict in self._frames.items():
+            frame_dir = self.root / f"frame_{frame}"
+            for split, frames in split_dict.items():
+                if not frames:
+                    continue
+                data = {**common, "frames": frames}
+                fname = f"transforms_{_SPLIT_MAP[split]}.json"
+                (frame_dir / fname).write_text(json.dumps(data, indent=4))
+
+    @staticmethod
+    def _matrix(mat): return [list(r) for r in mat]
+    
+# ---------- TACV writer ------------------------------------ #
+class TACVDatasetWriter(DatasetWriter):
+    """
+    Time-Archival Camera Virtualisation (TACV) format
+
+    Directory layout
+    ├── frame_1/
+    │   ├── train/          ← all rendered PNGs (train + test)
+    │   ├── transforms.json
+    │   └── transforms_test.json
+    ├── frame_2/
+    │   └── …               (same structure)
+    """
+    _DIST_KEYS = ("k1", "k2", "p1", "p2")          # 畸变系数可选
+
+    def __init__(self, root_out: Path, cam0) -> None:
+        super().__init__(root_out, cam0)
+        # per-frame → list[dict]
+        self._train: dict[int, list] = {}
+        self._test:  dict[int, list] = {}
+        self._seq:   dict[int, int]  = {}           # frame → running idx
+
+   # --------------------------- helpers --------------------------- #
+    @staticmethod
+    def _split_of(cam: bpy.types.Object) -> str:
+        return "test" if cam.name.endswith("_test") else "train"
+
+    @staticmethod
+    def _matrix(mat):  # 4×4 → nested list
+        return [list(r) for r in mat]
+
+
+    # ------------------------------------------------ public
+    def filepath_for(self, cam_obj: bpy.types.Object, _global_idx: int) -> Path:
+        frame = self._scene.frame_current
+        frame_dir = self.root / f"frame_{frame}" / "train"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+
+        seq = self._seq.setdefault(frame, 0)
+        filename = f"{seq}.png"        # 0.png, 1.png, …
+        self._seq[frame] += 1
+        return frame_dir / filename
+
+    def register_frame(self, cam_obj, rel_path):
+        frame  = self._scene.frame_current
+        split  = self._split_of(cam_obj)            # 'train' | 'test'
+        camdat = cam_obj.data
+        scene  = self._scene
+
+        # --- 分辨率 & 像素焦距 -------------------------------------------------
+        scale = scene.render.resolution_percentage / 100.0
+        w = scene.render.resolution_x * scale
+        h = scene.render.resolution_y * scale
+        # 注意：sensor_width / sensor_height 皆用得上
+        fx = camdat.lens / camdat.sensor_width  * w
+        fy = camdat.lens / camdat.sensor_height * h if camdat.sensor_fit == 'VERTICAL' else fx
+
+        # --- 畸变系数（若无则记 0.0） -----------------------------------------
+        dist = {k: float(camdat.get(k, 0.0)) for k in self._DIST_KEYS}
+        prefix = f"frame_{frame}/"
+        local_fp = rel_path[len(prefix):] if rel_path.startswith(prefix) else rel_path
+        if not local_fp.startswith("./"):
+            local_fp = "./" + local_fp   # => "./train/1.png"
+        item = {
+            "camera_angle_x": camdat.angle_x,
+            "camera_angle_y": camdat.angle_y,
+            "fl_x": fx,
+            "fl_y": fy,
+            **dist,
+            "cx": w * 0.5,
+            "cy": h * 0.5,
+            "w":  w,
+            "h":  h,
+            "aabb_scale": 2,
+            "transform_matrix": self._matrix(cam_obj.matrix_world),
+            "file_path":  local_fp               # e.g. "train/0.png"
+        }
+
+        coll = self._test if split == "test" else self._train
+        coll.setdefault(frame, []).append(item)
+
+    # 写文件：一个 frame 一对 transforms*.json ------------------------------- #
+    def finish(self):
+        for frame in set(self._train) | set(self._test):
+            frame_dir = self.root / f"frame_{frame}"
+            train_list = self._train.get(frame, [])
+            test_list  = self._test.get(frame, [])
+
+            if train_list:
+                (frame_dir / "transforms.json").write_text(
+                    json.dumps(train_list, indent=4)
+                )
+            if test_list:
+                (frame_dir / "transforms_test.json").write_text(
+                    json.dumps(test_list, indent=4)
+                )
+
+class ColmapPoseWriter(DatasetWriter):
+    """
+    Directory layout per frame (unchanged)::
+
+        frame_1/
+            images/0000.png 0001.png …
+            sparse/0/
+                cameras.txt / .bin   (one line per Blender camera)
+                images.txt  / .bin   (one line per rendered image)
+                points3D.txt         (empty placeholder)
+    """
+
+    def __init__(self, root_out: Path, cam0):
+        super().__init__(root_out, cam0)
+        self._seq_per_frame: dict[int, int] = {}            # frame → running idx
+        self._frames: dict[int, list[tuple[bpy.types.Object, Path]]] = {}
+
+        # 解析场景分辨率一次即可
+        scene = bpy.context.scene
+        scale = scene.render.resolution_percentage / 100.0
+        self._width  = int(scene.render.resolution_x * scale)
+        self._height = int(scene.render.resolution_y * scale)
+
+    # ------------------------------------------------------------ helpers ----
+    @staticmethod
+    def _blender_to_colmap(cam_obj: bpy.types.Object):
+        """
+        Convert Blender camera pose (camera-to-world) into COLMAP world-to-camera:
+        Returns (qw, qx, qy, qz, tx, ty, tz).
+        """
+        import mathutils as mu
+
+        M_c2w = cam_obj.matrix_world
+        # Blender → CV 右手系变换：+Y↓, +Z-forward
+        blender2cv = mu.Matrix((
+            (1, 0, 0, 0),
+            (0,-1, 0, 0),
+            (0, 0,-1, 0),
+            (0, 0, 0, 1),
+        ))
+
+        M_cv2w = M_c2w @ blender2cv
+        M_w2cv = M_cv2w.inverted()          # world → camera (CV)
+        R = M_w2cv.to_3x3()
+        t = M_w2cv.to_translation()
+        q = R.to_quaternion()               # (w, x, y, z)
+        return (q.w, q.x, q.y, q.z, t.x, t.y, t.z)
+
+    # ------------------------------------------------ dataset-writer API -----
+    def filepath_for(self, cam_obj, _global_idx):
+        """
+        Called by FrameDatasetRenderer for every image.
+        Returns absolute path where the render should be saved.
+        """
+        frame = bpy.context.scene.frame_current
+        seq   = self._seq_per_frame.setdefault(frame, 0)
+
+        img_dir = self.root / f"frame_{frame}" / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+
+        path = img_dir / f"{seq:04d}.png"
+        self._seq_per_frame[frame] += 1
+        return path
+
+    def register_frame(self, cam_obj, img_path: Path):
+        """
+        Record (camera object, absolute image path) for later writing txt/bin.
+        """
+        frame = bpy.context.scene.frame_current
+        self._frames.setdefault(frame, []).append((cam_obj, img_path))
+
+    # ------------------------------------------------ write txt & call colmap
+    def finish(self):
+        import shutil, subprocess, sys, os
+
+        for frame, items in self._frames.items():
+            sparse0 = self.root / f"frame_{frame}" / "sparse" / "0"
+            sparse0.mkdir(parents=True, exist_ok=True)
+
+            # -------- cameras.txt : one line per camera --------------------
+            cam_lines: list[str] = []
+            for cam_id, (cam_obj, _) in enumerate(items, start=1):
+                camdat = cam_obj.data
+                # 计算 fx, fy, cx, cy
+                fx = camdat.lens / camdat.sensor_width  * self._width
+                fy = fx
+                if camdat.sensor_fit == 'VERTICAL':
+                    fy = camdat.lens / camdat.sensor_height * self._height
+                cx, cy = self._width / 2.0, self._height / 2.0
+                cam_lines.append(
+                    f"{cam_id} PINHOLE {self._width} {self._height} "
+                    f"{fx} {fy} {cx} {cy}\n"
+                )
+            (sparse0 / "cameras.txt").write_text("".join(cam_lines))
+
+            # -------- images.txt : one line per rendered PNG ---------------
+            img_lines: list[str] = []
+            for img_id, (cam_obj, img_abs) in enumerate(items, start=1):
+                qw,qx,qy,qz, tx,ty,tz = self._blender_to_colmap(cam_obj)
+                # COLMAP 期望相对 images/ 路径，且用正斜杠
+                rel_name = Path(img_abs).name
+                camera_id = img_id         # 1-to-1，对应上面的 cam_id
+                img_lines.append(
+                    f"{img_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} "
+                    f"{camera_id} {rel_name}\n\n"
+                )
+            (sparse0 / "images.txt").write_text("".join(img_lines))
+
+            # -------- 空 points3D.txt 占位，让 model_converter 不报错 ------
+            (sparse0 / "points3D.txt").touch(exist_ok=True)
+
+            # -------- auto-convert .txt → .bin 若系统有 colmap ----------
+            colmap_exe = shutil.which("colmap")
+            if not colmap_exe:
+                print("[RS-Studio] ⚠  未检测到 'colmap' 命令，已保留 .txt 文件",
+                      file=sys.stdout)
+                continue
+
+            # 确保 Windows 路径含空格时也能执行：使用 list 传参
+            cmd = [
+                colmap_exe, "model_converter",
+                "--input_path",  os.fspath(sparse0),
+                "--output_path", os.fspath(sparse0),
+                "--output_type", "BIN",
+            ]
+            print("[RS-Studio] ▶  running:", " ".join(cmd), file=sys.stdout)
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                print("[RS-Studio] ❌  colmap model_converter failed:", e,
+                      file=sys.stderr)
+# ------------------------------------------------------------------ 3DGS Writer
+class Colmap3DGSWriter(ColmapPoseWriter):
+    """
+    对每个 frame 依次执行：
+        feature_extractor  →  exhaustive_matcher  →  mapper  →  model_converter
+    生成真实的 cameras / images / points3D .bin 文件。
+    若系统找不到 COLMAP，则自动降级为 ColmapPoseWriter（只写位姿）。
+    """
+    def __init__(self, root_out: Path, cam0, frame_cnt: int, colmap_ok: bool):
+        super().__init__(root_out, cam0)
+        self._frame_cnt   = frame_cnt
+        self._colmap_ok   = colmap_ok
+
+    # 满足抽象接口——这里交给 postprocess_iter 真正收尾
+    def finish(self):
+        pass
+
+    # 每帧：feature + match + mapper + converter  ⇒ 4 步
+    @property
+    def extra_steps(self) -> int:
+        return 0 if not self._colmap_ok else self._frame_cnt * 4
+
+    # ------------------------------ 后处理主逻辑 ------------------------------ #
+    def postprocess_iter(self) -> Iterator[None]:
+        """
+        ① 如果用户未安装 COLMAP 或任何一步出错，则自动退回“poses-only”导出；
+        ② 在 Blender Console 打印完整 stderr，方便定位；
+        ③ 始终保证 cameras.txt / images.txt / points3D.(txt|bin) 被落盘。
+        """
+        import subprocess, os, shutil
+
+        # --------- 如果之前检测到没有 colmap，直接写位姿文件并结束 --------- #
+        if not self._colmap_ok:
+            super().finish()
+            return
+
+        # --------- 对每个 frame_x 逐帧调用 COLMAP 管道 --------- #
+        for frame, _items in self._frames.items():
+            frame_dir   = self.root / f"frame_{frame}"
+            img_dir     = frame_dir / "images"
+            db_path     = frame_dir / "database.db"
+            sparse_root = frame_dir / "sparse"
+            sparse_root.mkdir(parents=True, exist_ok=True)
+
+            # 把 subprocess.run 写成一个小工具，统一错误处理
+            def _run(cmd: list[str], step: str):
+                try:
+                    subprocess.run(
+                        cmd,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                except subprocess.CalledProcessError as e:
+                    # 记录日志到控制台并告知用户
+                    print(f"[RS-Studio] ❌ COLMAP {step} failed:\n{e.stderr}")
+                    print(f"[RS-Studio] ⚠  COLMAP {step} failed on frame_{frame}; "
+                          f"falling back to poses-only.")
+                    # 标记失败：后续 frame 也不再跑 COLMAP
+                    self._colmap_ok = False
+                    return False
+                return True
+
+            # 1) feature_extractor
+            if not _run([
+                "colmap", "feature_extractor",
+                "--ImageReader.camera_model", "PINHOLE",
+                "--database_path",  os.fspath(db_path),
+                "--image_path",     os.fspath(img_dir),
+                # ❗ 已去掉 --ImageReader.single_camera 1
+            ], "feature_extractor"):
+                break
+            yield None  # +1 进度
+
+            # 2) exhaustive_matcher
+            if not _run([
+                "colmap", "exhaustive_matcher",
+                "--database_path", os.fspath(db_path),
+            ], "exhaustive_matcher"):
+                break
+            yield None  # +1
+
+            # 3) mapper
+            if not _run([
+                "colmap", "mapper",
+                "--database_path", os.fspath(db_path),
+                "--image_path",    os.fspath(img_dir),
+                "--output_path",   os.fspath(sparse_root),
+                "--Mapper.num_threads", "8",
+            ], "mapper"):
+                break
+
+            # 如果 mapper 没产生 0 号模型，就把第一个模型重命名为 0
+            model_dirs = sorted(p for p in sparse_root.iterdir() if p.is_dir())
+            model_0 = sparse_root / "0"
+            if not model_0.exists() and model_dirs:
+                model_dirs[0].rename(model_0)
+            yield None  # +1
+
+            # 4) txt / bin 互转，确保生成 .bin
+            if not _run([
+                "colmap", "model_converter",
+                "--input_path",  os.fspath(model_0),
+                "--output_path", os.fspath(model_0),
+                "--output_type", "BIN",
+            ], "model_converter"):
+                break
+            yield None  # +1
+
+        # --------- 如果任何一步失败，则 fallback 为 poses-only --------- #
+        if not self._colmap_ok:
+            super().finish()  # 写 cameras / images / points3D.txt
 
 # --------------------------------------------------------------------------- #
 # Sampling
@@ -141,122 +656,82 @@ class CameraRig:
         return iter(self.cameras)
 
 
-# --------------------------------------------------------------------------- #
-# Single‑frame renderer (incremental)
-# --------------------------------------------------------------------------- #
-class FrameDatasetRenderer:
-    """Render **one** Blender timeline frame using a fixed camera rig."""
 
-    def __init__(self, frame_idx: int, cameras: Sequence[bpy.types.Object]):
-        self.frame_idx = frame_idx
-        self.cameras = list(cameras)
-        self._frames_meta: List[dict] = []
-
-    # --------------------------------------------------------------------- #
-    # Public: incremental generator
-    # --------------------------------------------------------------------- #
-    def iter_render(self, root_out: Path) -> Iterator[None]:
-        """Render one image at a time and yield control after each."""
-        scene = bpy.context.scene
-        scene.frame_set(self.frame_idx)
-
-        frame_dir = root_out / f"frame_{self.frame_idx}"
-        train_dir = frame_dir / "train"
-        train_dir.mkdir(parents=True, exist_ok=True)
-
-        for view_idx, cam in enumerate(self.cameras):
-            scene.camera = cam
-            scene.render.filepath = str(train_dir / f"render_{view_idx:04d}.png")
-
-            # -- render just one image ------------------------------------- #
-            bpy.ops.render.render(write_still=True, use_viewport=True)
-
-            # -- record metadata ------------------------------------------- #
-            self._frames_meta.append(
-                {
-                    "file_path": f"train/render_{view_idx:04d}.png",
-                    "transform_matrix": self._matrix_to_list(cam.matrix_world),
-                }
-            )
-
-            yield None  # hand control back to modal operator
-
-        # -- write transforms.json once all views are done ----------------- #
-        self._write_transforms_json(frame_dir)
-
-    # --------------------------------------------------------------------- #
-    # Helpers
-    # --------------------------------------------------------------------- #
-    @staticmethod
-    def _matrix_to_list(mat) -> List[List[float]]:
-        return [list(row) for row in mat]
-
-    def _write_transforms_json(self, frame_dir: Path) -> None:
-        """Write NeRF‑style transforms.json using collected frame metadata."""
-        cam = self.cameras[0].data  # all cameras share identical intrinsics
-        scene = bpy.context.scene
-
-        scale = scene.render.resolution_percentage / 100.0
-        width = scene.render.resolution_x * scale
-        height = scene.render.resolution_y * scale
-        focal_mm = cam.lens
-        sensor_mm = cam.sensor_width
-        focal_px = focal_mm / sensor_mm * width
-
-        data = {
-            "camera_angle_x": cam.angle_x,
-            "camera_angle_y": cam.angle_y,
-            "fl_x": focal_px,
-            "fl_y": focal_px,
-            "cx": width * 0.5,
-            "cy": height * 0.5,
-            "w": width,
-            "h": height,
-            "frames": self._frames_meta,
-        }
-
-        with open(frame_dir / "transforms.json", "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
-
-
-# --------------------------------------------------------------------------- #
-# Multi‑frame driver (also incremental)
-# --------------------------------------------------------------------------- #
 class DatasetGenerator:
-    """Drive timeline frames using *existing* RS Studio cameras."""
-
-    def __init__(
-        self,
-        cameras: Sequence[bpy.types.Object],
-        start_frame: int,
-        end_frame: int,
-    ) -> None:
-        if not cameras:
-            raise ValueError("No RS Studio cameras supplied")
-
+    # 新增 export_format 参数
+    def __init__(self, *, cameras, start_frame, end_frame,
+                 export_fmt: ExportFormat = ExportFormat.NGP):
+        if end_frame < start_frame:
+            raise ValueError("end_frame must be ≥ start_frame")
+        self._colmap_ok = bool(shutil.which("colmap"))
         self.cameras = list(cameras)
-        self.start = start_frame
-        self.end = end_frame
+        self.start   = int(start_frame)
+        self.end     = int(end_frame)
+        self.export_fmt = export_fmt
+        frame_cnt = self.end - self.start + 1
+        if export_fmt is ExportFormat.COLMAP_3DGS and self._colmap_ok:
+            per_frame_extra = 3
+        else:
+            per_frame_extra = 0
+        self.total_images = len(self.cameras) * frame_cnt + per_frame_extra
+        
+    def iter_generate(self, output_dir: str | Path):
+        from bpy.types import RenderSettings
 
-    # --------------------------------------------------------------------- #
-    # Properties
-    # --------------------------------------------------------------------- #
-    @property
-    def total_images(self) -> int:
-        return (self.end - self.start + 1) * len(self.cameras)
+        scene = bpy.context.scene
+        prev_engine = scene.render.engine
 
-    # --------------------------------------------------------------------- #
-    # Public incremental generator
-    # --------------------------------------------------------------------- #
-    def iter_generate(self, output_dir: str | Path) -> Iterator[Tuple[int, int]]:
-        """Incrementally generate the whole dataset."""
-        root_out = Path(bpath.abspath(str(output_dir))).resolve()
-        root_out.mkdir(parents=True, exist_ok=True)
+        # 枚举所有可用引擎，优先选 EEVEE Next，否则退回 Cycles
+        engines = {e.identifier for e in RenderSettings.bl_rna.properties["engine"].enum_items}
+        preferred = "BLENDER_EEVEE_NEXT" if "BLENDER_EEVEE_NEXT" in engines else "CYCLES"
 
-        done, total = 0, self.total_images
+        if scene.render.engine == "BLENDER_WORKBENCH":
+            scene.render.engine = preferred        # 切换到能渲染贴图的引擎
+        try:  
+            root_out = Path(bpath.abspath(str(output_dir))).resolve()
+            root_out.mkdir(parents=True, exist_ok=True)
 
-        for frame_idx in range(self.start, self.end + 1):
-            renderer = FrameDatasetRenderer(frame_idx=frame_idx, cameras=self.cameras)
-            for _ in renderer.iter_render(root_out):
+            cam0 = self.cameras[0].data
+            frame_cnt = self.end - self.start + 1
+
+            # ---------- 创建 writer 实例 ----------
+            if self.export_fmt is ExportFormat.COLMAP_3DGS:
+                if self._colmap_ok:
+                    writer = Colmap3DGSWriter(root_out, cam0, frame_cnt, True)
+                else:
+                    writer = ColmapPoseWriter(root_out, cam0)
+            elif self.export_fmt is ExportFormat.COLMAP_POSES:
+                writer = ColmapPoseWriter(root_out, cam0)
+            elif self.export_fmt is ExportFormat.NERF_SYNTH:
+                writer = NeRFSyntheticWriter(root_out, cam0)
+            elif self.export_fmt is ExportFormat.TACV:
+                writer = TACVDatasetWriter(root_out, cam0)
+            else:                                        # 默认 Instant-NGP
+                writer = NGPDatasetWriter(root_out, cam0)
+
+            self._writer_inst = writer                   # 供后处理阶段使用
+
+            # ---------- 渲染循环 ----------
+            done = 0
+            for frame_idx in range(self.start, self.end + 1):
+                bpy.context.scene.frame_set(frame_idx)
+                for cam in self.cameras:
+                    path = writer.filepath_for(cam, done)
+                    bpy.context.scene.camera = cam
+                    bpy.context.scene.render.filepath = str(path)
+                    bpy.ops.render.render(write_still=True, use_viewport=False)
+
+                    rel = path.relative_to(root_out).as_posix()
+                    writer.register_frame(cam, rel)
+
+                    done += 1
+                    yield done, self.total_images
+
+            # ---------- 后处理 ----------
+            for _ in writer.postprocess_iter():
                 done += 1
-                yield done, total
+                yield done, self.total_images
+
+            writer.finish()
+        finally:
+            scene.render.engine = prev_engine      # 恢复用户原设置

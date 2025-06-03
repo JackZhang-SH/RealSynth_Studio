@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+import shutil
 from typing import Optional, Dict, Tuple
 
 import bpy
@@ -31,6 +32,7 @@ from mathutils import Vector
 
 from .core import (
     DatasetGenerator,
+    ExportFormat,
     FibonacciSphereSampling,
     FibonacciHemisphereSampling,
 )
@@ -197,7 +199,22 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         ],
         default="DEFAULT",
     )
-
+    export_format: bpy.props.EnumProperty(# type: ignore
+        name="Export Format",
+        items=[
+            ("NGP",        "Instant-NGP",      "Instant-NGP compatible"),
+            ("NERF_SYNTH", "NeRF Synthetic",   "train/val/test + transforms_*.json"),
+            ("TACV",       "TACV",          "frame_n/train + transforms.json + transforms_test.json"),
+            ("COLMAP_POSES", "COLMAP (poses only)", "images/ + cameras/images .bin"),  
+            ("COLMAP_3DGS", "3DGS (COLMAP)", "sparse/*.bin with point cloud"),
+        ],
+        default="NGP",
+    )
+    aabb_scale: bpy.props.IntProperty(                 # ← 放在其它参数后面即可
+    name="AABB Scale",
+    min=1, default=2,
+    description="Axis-aligned bounding-box scale used by Instant-NGP"
+    )  # type: ignore
 
 # --------------------------------------------------------------------------- #
 # Camera-split operator
@@ -376,7 +393,9 @@ class RS_OT_GenerateDataset(bpy.types.Operator):
 
         s = context.scene.rs_settings
         wm = context.window_manager
-
+        if s.export_format == "COLMAP_3DGS" and not shutil.which("colmap"):
+            self.report({"WARNING"},
+                "未检测到 COLMAP，可执行文件 'colmap' 不在 PATH，已降级为 “COLMAP (poses only)”")
         rs_cams = [
             o for o in bpy.data.objects if o.type == "CAMERA" and o.name.startswith(RS_CAMERA_PREFIX)
         ]
@@ -385,7 +404,10 @@ class RS_OT_GenerateDataset(bpy.types.Operator):
             return {"CANCELLED"}
 
         generator = DatasetGenerator(
-            cameras=rs_cams, start_frame=s.start_frame, end_frame=s.end_frame
+            cameras=rs_cams,
+            start_frame=s.start_frame,
+            end_frame=s.end_frame,
+            export_fmt=ExportFormat[s.export_format],
         )
         self._total_images = generator.total_images
 
@@ -415,6 +437,9 @@ class RS_OT_GenerateDataset(bpy.types.Operator):
                 done, total = next(self._iterator)
             except StopIteration:
                 self._finish(wm, s, cancelled=False)
+                # ⬇️ 新增：强制刷新当前区域，立刻让进度条消失
+                context.area.tag_redraw()
+
                 self.report({"INFO"}, "Dataset generation finished ✔")
                 return {"FINISHED"}
             except Exception as exc:
@@ -437,7 +462,10 @@ class RS_OT_GenerateDataset(bpy.types.Operator):
         settings.is_running = False
         settings.progress = 0.0 if cancelled else 1.0
         _active_generator = None
-
+        # ⬇️ 新增：刷新所有 3D-View，让 N-panel 立即重绘
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
     def cancel(self, context):
         self._cancel_requested = True
 
