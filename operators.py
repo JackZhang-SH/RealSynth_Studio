@@ -21,6 +21,7 @@ FLAG   : #CC79A7  → same as BAD
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 import shutil
@@ -28,8 +29,9 @@ from typing import Optional, Dict, Tuple
 
 import bpy
 import bpy.path as bpath
-from mathutils import Vector
+from mathutils import Vector, Quaternion, Matrix
 
+from .importers import IMPORTER_REGISTRY
 from .core import (
     DatasetGenerator,
     ExportFormat,
@@ -157,71 +159,71 @@ def _force_object_color_shading() -> None:
                 for space in area.spaces:
                     if space.type == 'VIEW_3D':
                         space.shading.color_type = 'OBJECT'
+# settings 枚举动态生成
+def _import_items(self, _context):
+    return [(k, k, "") for k in IMPORTER_REGISTRY.keys()]
 
-
-# --------------------------------------------------------------------------- #
-# Scene-level settings
-# --------------------------------------------------------------------------- #
+# ─────────────────────── Scene-level settings ───────────────────── #
 class RSDatasetSettings(bpy.types.PropertyGroup):
-    output_dir: bpy.props.StringProperty(
-        name="Output Directory", subtype="DIR_PATH", default="//nerf_dataset"
-    )  # type: ignore
-    start_frame: bpy.props.IntProperty(name="Start Frame", min=1, default=1)  # type: ignore
-    end_frame: bpy.props.IntProperty(name="End Frame", min=1, default=1)  # type: ignore
-
+    # ---------- camera generation ----------
     images_per_frame: bpy.props.IntProperty(
         name="Camera Count", min=1, default=60
-    )  # type: ignore
-    sampling_strategy: bpy.props.EnumProperty(  # type: ignore
-        name="Sampling Strategy",
+    ) # type: ignore
+    sampling_strategy: bpy.props.EnumProperty(
+        name="Sampling",
         items=[
-            ("HEMI", "Fibonacci (Upper-Hemisphere)", "Uniformly sample cameras on z ≥ 0"),
-            ("SPHERE", "Fibonacci (Full-Sphere)", "Uniformly sample the entire sphere"),
+            ("HEMI",    "Fibonacci (Upper-Hemisphere)", ""),
+            ("SPHERE",  "Fibonacci (Full-Sphere)",       ""),
         ],
         default="HEMI",
-    )
-    radius: bpy.props.FloatProperty(name="Sphere Radius", min=0.1, default=10.0)  # type: ignore
+    )# type: ignore
+    radius: bpy.props.FloatProperty(name="Sphere Radius", min=0.1, default=10.0)# type: ignore
     target_point: bpy.props.FloatVectorProperty(
         name="Target Point", subtype="TRANSLATION", default=(0.0, 0.0, 0.0)
-    )  # type: ignore
-
-    progress: bpy.props.FloatProperty(
-        name="Progress", min=0.0, max=1.0, default=0.0, subtype="FACTOR"
-    )  # type: ignore
-    is_running: bpy.props.BoolProperty(name="Generating", default=False)  # type: ignore
-    cameras_generated: bpy.props.BoolProperty(name="Cameras Generated", default=False)  # type: ignore
-
-    camera_source: bpy.props.EnumProperty(  # type: ignore
-        name="Camera Source",
+    )# type: ignore
+    camera_source: bpy.props.EnumProperty(
+        name="Template",
         items=[
-            ("DEFAULT", "Default Camera", "Use Blender default camera as template"),
-            ("IMPORT", "Import JSON", "Load intrinsic & extrinsic from external json (coming soon)"),
+            ("DEFAULT", "Default Camera", "Use current scene camera"),
         ],
         default="DEFAULT",
-    )
-    export_format: bpy.props.EnumProperty(# type: ignore
-        name="Export Format",
+    )# type: ignore
+
+    # ---------- new: camera import ----------
+    import_format: bpy.props.EnumProperty(
+        name="Format", items=_import_items
+    )# type: ignore
+    import_dir: bpy.props.StringProperty(
+        name="Model Folder", subtype="DIR_PATH", default="//colmap_model"
+    )# type: ignore
+
+    # ---------- dataset generation ----------
+    output_dir: bpy.props.StringProperty(
+        name="Output Dir", subtype="DIR_PATH", default="//nerf_dataset"
+    )# type: ignore
+    start_frame: bpy.props.IntProperty(name="Start", min=1, default=1)# type: ignore
+    end_frame: bpy.props.IntProperty(name="End", min=1, default=1)# type: ignore
+    export_format: bpy.props.EnumProperty(
+        name="Export",
         items=[
-            ("NGP",        "Instant-NGP",      "Instant-NGP compatible"),
-            ("NERF_SYNTH", "NeRF Synthetic",   "train/val/test + transforms_*.json"),
-            ("TACV",       "TACV",          "frame_n/train + transforms.json + transforms_test.json"),
-            ("COLMAP_POSES", "COLMAP (poses only)", "images/ + cameras/images .bin"),  
-            ("COLMAP_3DGS", "3DGS (COLMAP)", "sparse/*.bin with point cloud"),
+            ("NGP",          "Instant-NGP",        ""),
+            ("NERF_SYNTH",   "NeRF Synthetic",     ""),
+            ("TACV",         "TACV",               ""),
+            ("COLMAP_POSES", "COLMAP (poses)",     ""),
+            ("COLMAP_3DGS",  "3DGS (COLMAP)",      ""),
         ],
         default="NGP",
+    )# type: ignore
+    aabb_scale: bpy.props.IntProperty(name="AABB Scale", min=1, default=2)# type: ignore
+    scale: bpy.props.FloatProperty(# type: ignore
+        name="Scale", min=0.0001, default=1.0,
+        description="Multiply camera translation by this factor",
     )
-    aabb_scale: bpy.props.IntProperty(                 # ← 放在其它参数后面即可
-    name="AABB Scale",
-    min=1, default=2,
-    description="Axis-aligned bounding-box scale used by Instant-NGP"
-    )  # type: ignore
 
-    scale: bpy.props.FloatProperty(              # type: ignore
-        name="Scale",
-        min=0.0001, default=1.0,
-        description="Multiply every camera translation by this factor "
-                    "so that the scene fits into [-scale, scale]³"
-    )
+    # ---------- runtime ----------
+    progress: bpy.props.FloatProperty(name="Progress", min=0.0, max=1.0, default=0.0)# type: ignore
+    is_running: bpy.props.BoolProperty(name="Generating", default=False)# type: ignore
+    cameras_generated: bpy.props.BoolProperty(name="Cameras Ready", default=False)# type: ignore
 
 # --------------------------------------------------------------------------- #
 # Camera-split operator
@@ -375,7 +377,81 @@ class RS_OT_ClearCameras(bpy.types.Operator):
         context.scene.rs_settings.cameras_generated = False
         self.report({"INFO"}, f"Removed {len(cams)} cameras")
         return {"FINISHED"}
+    
+# ───────────────────────── Import cameras ───────────────────────── #
+class RS_OT_ImportCameras(bpy.types.Operator):
+    """Import external cameras → RS-Studio cameras (default *train*)."""
 
+    bl_idname = "rs.import_cameras"
+    bl_label  = "Import Cameras"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        s   = context.scene.rs_settings
+        fmt = s.import_format
+        importer = IMPORTER_REGISTRY.get(fmt)
+        if importer is None:
+            self.report({'ERROR'}, f"Unsupported format: {fmt}")
+            return {'CANCELLED'}
+
+        model_dir = Path(bpy.path.abspath(s.import_dir)).resolve()
+
+        # ① collections
+        subcols   = _ensure_collections()
+        train_col = subcols["train"]
+
+        # ② next camera index
+        existing = [
+            o for o in bpy.data.objects
+            if o.type == "CAMERA" and o.name.startswith(RS_CAMERA_PREFIX)
+        ]
+        used = {
+            int(m.group(1))
+            for o in existing
+            if (m := re.match(rf"{RS_CAMERA_PREFIX}_(\d+)", o.name))
+        }
+        next_idx = max(used) + 1 if used else 0
+
+        # ③ call concrete importer
+        try:
+            created = importer(
+                model_dir,
+                name_prefix = RS_CAMERA_PREFIX,
+                start_index = next_idx,
+                collection  = train_col,
+                color       = SPLIT_COLORS["train"],
+            )
+        except Exception as e:
+            self.report({'ERROR'}, f"Import failed: {e}")
+            return {'CANCELLED'}
+
+        if created == 0:
+            self.report({'WARNING'}, "No cameras imported (empty model?)")
+            return {'CANCELLED'}
+
+        # ④ make sure marker exists *and* sits at cam location
+        for idx in range(next_idx, next_idx + created):
+            cam_name = f"{RS_CAMERA_PREFIX}_{idx}_train"
+            cam = bpy.data.objects.get(cam_name)
+            if cam is None or cam.type != 'CAMERA':
+                continue
+
+            marker = _get_marker(cam)
+            if marker is None:
+                # create fresh marker
+                marker = _ensure_marker(cam, SPLIT_COLORS["train"], train_col)
+            else:
+                # relocate / re-orient existing marker
+                marker.location = cam.location
+                marker.rotation_euler = cam.rotation_euler
+                if marker.name not in train_col.objects:
+                    train_col.objects.link(marker)
+
+        s.cameras_generated = True
+        _force_object_color_shading()
+
+        self.report({'INFO'}, f"Imported {created} camera(s) from {fmt}")
+        return {'FINISHED'}
 
 # --------------------------------------------------------------------------- #
 # Dataset generation (unchanged)
@@ -509,4 +585,5 @@ CLASSES = [
     RS_OT_GenerateCameras,
     RS_OT_ClearCameras,
     RS_OT_SetCameraSplit,
+    RS_OT_ImportCameras,    
 ]
