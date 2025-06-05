@@ -56,6 +56,7 @@ class RS_PT_MainPanel(bpy.types.Panel):
         ds_box.prop(s, "start_frame")
         ds_box.prop(s, "end_frame")
         ds_box.prop(s, "export_format", text="Format")
+        ds_box.prop(s, "scale")               # ← always visible
         if s.export_format == "NGP":               # ★ 仅 NGP 时显示
             ds_box.prop(s, "aabb_scale")
         if s.is_running:

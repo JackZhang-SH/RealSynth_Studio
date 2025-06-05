@@ -62,7 +62,12 @@ class DatasetWriter(ABC):
         scale  = self._scene.render.resolution_percentage / 100.0
         self.w = int(round(self._scene.render.resolution_x * scale))
         self.h = int(round(self._scene.render.resolution_y * scale))
-        self.fx = cam0.lens / cam0.sensor_width * self.w
+        # --- focal lengths computed from field-of-view (sensor-fit agnostic) ----
+        self.fx = 0.5 * self.w / math.tan(cam0.angle_x * 0.5)
+        self.fy = 0.5 * self.h / math.tan(cam0.angle_y * 0.5)
+
+        # global translation-scale (user-controlled)
+        self._scale = getattr(bpy.context.scene.rs_settings, "scale", 1.0)
 
     # --------- public API every subclass must offer --------- #
     @abstractmethod
@@ -87,7 +92,15 @@ class DatasetWriter(ABC):
     def postprocess_iter(self) -> Iterator[None]:
         if False:
             yield None
-
+    # apply global scale to translation part of a 4×4 matrix
+    def _matrix(self, mat):
+        m = [list(r) for r in mat]
+        if self._scale != 1.0:
+            m[0][3] *= self._scale
+            m[1][3] *= self._scale
+            m[2][3] *= self._scale
+        return m
+    
 # ---------- Instant-NGP (unchanged behaviour) --------------- #
 class NGPDatasetWriter(DatasetWriter):
     def __init__(self, root_out: Path, cam0: bpy.types.Camera) -> None:
@@ -120,8 +133,7 @@ class NGPDatasetWriter(DatasetWriter):
 
         # 若相机 data 上没有这些自定义属性就自动填 0
         dist = {k: float(self.cam0.get(k, 0.0)) for k in ("k1","k2","p1","p2")}
-        fx = 0.5 * self.w / math.tan(self.cam0.angle_x * 0.5)
-        fy = 0.5 * self.h / math.tan(self.cam0.angle_y * 0.5)
+        fx, fy = self.fx, self.fy        # ← now strictly from cam0
         for frame, frames_meta in self._per_frame_meta.items():
             out = {
                 "camera_angle_x": self.cam0.angle_x,
@@ -132,18 +144,18 @@ class NGPDatasetWriter(DatasetWriter):
                 "cy":   self.h * 0.5,
                 "w": self.w, "h": self.h,
                 "aabb_scale": aabb,            # ★ 新增
+                "scale":  self._scale,   # record for downstream tools
                 "frames": frames_meta,
             }
             (self.root / f"frame_{frame}" / "transforms.json").write_text(
                 json.dumps(out, indent=4)
             )
 
-    @staticmethod
-    def _matrix(mat): return [list(r) for r in mat]
 
     
 # ---------- NeRF-Synthetic writer --------------------------- #
 _SPLIT_MAP = {"train": "train", "valid": "val", "test": "test"}
+
 
 class NeRFSyntheticWriter(DatasetWriter):
     def __init__(self, root_out: Path, cam0):
@@ -165,20 +177,25 @@ class NeRFSyntheticWriter(DatasetWriter):
         frame  = self._scene.frame_current
         split  = self._split_of(cam_obj)               # 'train' | 'valid' | 'test'
 
-        # 递增序号
+        # incrementing sequence number per (frame, split)
         self._seq.setdefault(frame, {}).setdefault(split, 0)
         idx = self._seq[frame][split]
         self._seq[frame][split] += 1
 
         frame_dir = self.root / f"frame_{frame}" / _SPLIT_MAP[split]
         frame_dir.mkdir(parents=True, exist_ok=True)
-        return frame_dir / f"r_{idx}.png"
+
+        # RETURN PATH WITHOUT ".png" SUFFIX:
+        # Blender will add ".png" when saving; Nerfstudio JSON expects no ".png" here.
+        return frame_dir / f"r_{idx}"
 
     def register_frame(self, cam_obj, rel_path):
         frame  = self._scene.frame_current
         split  = self._split_of(cam_obj)
         prefix = f"frame_{frame}/"
         local_fp = rel_path[len(prefix):] if rel_path.startswith(prefix) else rel_path
+
+        # If the rel_path comes in without ".png", ensure any consumer adds ".png" when loading.
         if not local_fp.startswith("./"):
             local_fp = "./" + local_fp
 
@@ -192,7 +209,7 @@ class NeRFSyntheticWriter(DatasetWriter):
         common = {
             "camera_angle_x": self.cam0.angle_x,
             "camera_angle_y": self.cam0.angle_y,
-            "fl_x": self.fx, "fl_y": self.fx,
+            "fl_x": self.fx, "fl_y": self.fy,
             "cx":  self.w * 0.5, "cy": self.h * 0.5,
             "w":   self.w,       "h":  self.h,
         }
@@ -206,8 +223,6 @@ class NeRFSyntheticWriter(DatasetWriter):
                 fname = f"transforms_{_SPLIT_MAP[split]}.json"
                 (frame_dir / fname).write_text(json.dumps(data, indent=4))
 
-    @staticmethod
-    def _matrix(mat): return [list(r) for r in mat]
     
 # ---------- TACV writer ------------------------------------ #
 class TACVDatasetWriter(DatasetWriter):
@@ -236,10 +251,6 @@ class TACVDatasetWriter(DatasetWriter):
     def _split_of(cam: bpy.types.Object) -> str:
         return "test" if cam.name.endswith("_test") else "train"
 
-    @staticmethod
-    def _matrix(mat):  # 4×4 → nested list
-        return [list(r) for r in mat]
-
 
     # ------------------------------------------------ public
     def filepath_for(self, cam_obj: bpy.types.Object, _global_idx: int) -> Path:
@@ -262,9 +273,9 @@ class TACVDatasetWriter(DatasetWriter):
         scale = scene.render.resolution_percentage / 100.0
         w = scene.render.resolution_x * scale
         h = scene.render.resolution_y * scale
-        # 注意：sensor_width / sensor_height 皆用得上
-        fx = camdat.lens / camdat.sensor_width  * w
-        fy = camdat.lens / camdat.sensor_height * h if camdat.sensor_fit == 'VERTICAL' else fx
+
+        fx = 0.5 * w / math.tan(camdat.angle_x * 0.5)
+        fy = 0.5 * h / math.tan(camdat.angle_y * 0.5)
 
         # --- 畸变系数（若无则记 0.0） -----------------------------------------
         dist = {k: float(camdat.get(k, 0.0)) for k in self._DIST_KEYS}
@@ -283,6 +294,7 @@ class TACVDatasetWriter(DatasetWriter):
             "w":  w,
             "h":  h,
             "aabb_scale": 2,
+            "scale":       self._scale,
             "transform_matrix": self._matrix(cam_obj.matrix_world),
             "file_path":  local_fp               # e.g. "train/0.png"
         }
@@ -330,8 +342,7 @@ class ColmapPoseWriter(DatasetWriter):
         self._height = int(scene.render.resolution_y * scale)
 
     # ------------------------------------------------------------ helpers ----
-    @staticmethod
-    def _blender_to_colmap(cam_obj: bpy.types.Object):
+    def _blender_to_colmap(self, cam_obj: bpy.types.Object):
         """
         Convert Blender camera pose (camera-to-world) into COLMAP world-to-camera:
         Returns (qw, qx, qy, qz, tx, ty, tz).
@@ -350,7 +361,7 @@ class ColmapPoseWriter(DatasetWriter):
         M_cv2w = M_c2w @ blender2cv
         M_w2cv = M_cv2w.inverted()          # world → camera (CV)
         R = M_w2cv.to_3x3()
-        t = M_w2cv.to_translation()
+        t = M_w2cv.to_translation() * self._scale
         q = R.to_quaternion()               # (w, x, y, z)
         return (q.w, q.x, q.y, q.z, t.x, t.y, t.z)
 

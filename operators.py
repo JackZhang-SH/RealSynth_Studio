@@ -216,6 +216,13 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
     description="Axis-aligned bounding-box scale used by Instant-NGP"
     )  # type: ignore
 
+    scale: bpy.props.FloatProperty(              # type: ignore
+        name="Scale",
+        min=0.0001, default=1.0,
+        description="Multiply every camera translation by this factor "
+                    "so that the scene fits into [-scale, scale]³"
+    )
+
 # --------------------------------------------------------------------------- #
 # Camera-split operator
 # --------------------------------------------------------------------------- #
