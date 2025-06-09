@@ -30,15 +30,27 @@ class RS_PT_MainPanel(bpy.types.Panel):
         # ─────────────── Import Cameras ─────────────── #
         imp = layout.box()
         imp.label(text="Import Cameras", icon='IMPORT')
+
+        # ↓ Show required file/folder hints based on selected format
+        help_text = {
+            "COLMAP"    : "Select the folder containing cameras.txt & images.txt",
+            "NGP"       : "Select the folder containing transforms.json",
+            "TACV"      : "Select the folder containing transforms.json & transforms_test.json",
+            "NERF_SYNTH": "Select the folder containing transforms_train/val/test.json",
+            "CMU_PANOPTIC"  : "Select either a calibration .json file or a folder containing it",
+        }.get(s.import_format, "")
+        if help_text:
+            imp.label(text=help_text, icon='INFO')
         imp.prop(s, "import_format", text="Format")
         imp.prop(s, "import_dir")
+        imp.prop(s, "import_scale", text="Scale")   # ★ new line
         imp.operator("rs.import_cameras", icon='IMPORT')
 
         layout.separator()
 
         # ─────────────── Camera Rig ─────────────── #
         cam_box = layout.box()
-        cam_box.label(text="Camera Rig", icon='CAMERA_DATA')
+        cam_box.label(text="Camera Generator", icon='CAMERA_DATA')
         cam_box.prop(s, "images_per_frame")
         cam_box.prop(s, "sampling_strategy")
         cam_box.prop(s, "radius")

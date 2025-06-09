@@ -114,18 +114,23 @@ def _ensure_marker(
     color: Tuple[float, float, float, float],
     collection: bpy.types.Collection,
 ) -> bpy.types.Object:
-    """Attach / update a coloured icosphere (Mesh) as camera marker."""
+    """
+    Attach / update a coloured icosphere (Mesh) as camera marker.
+    Always keeps marker at the camera's world transform.
+    """
     marker = _get_marker(cam)
     if marker is None:
         mesh = _get_shared_marker_mesh()
         marker = bpy.data.objects.new(f"{cam.name}{_MARKER_SUFFIX}", mesh)
-        marker.hide_render = True                   # 不进入最终渲染
-        marker.parent = cam
-        marker.matrix_parent_inverse = cam.matrix_world.inverted()
-        marker.scale = (1, 1, 1)        # 比较小，不挡视线
+        marker.hide_render = True
         collection.objects.link(marker)
+        marker.parent = cam
 
-    marker.color = color                           # 直接用 object.color
+    # ── 无论新建/已有，都同步到相机位姿 ────────────────────────
+    marker.matrix_parent_inverse = cam.matrix_world.inverted()
+    marker.matrix_world          = cam.matrix_world
+    marker.scale = (1.0, 1.0, 1.0)
+    marker.color = color
     return marker
 
 def _move_between_split_collections(
@@ -166,21 +171,26 @@ def _import_items(self, _context):
 # ─────────────────────── Scene-level settings ───────────────────── #
 class RSDatasetSettings(bpy.types.PropertyGroup):
     # ---------- camera generation ----------
-    images_per_frame: bpy.props.IntProperty(
-        name="Camera Count", min=1, default=60
-    ) # type: ignore
-    sampling_strategy: bpy.props.EnumProperty(
-        name="Sampling",
+    images_per_frame: bpy.props.IntProperty(          # 生成的相机数量
+        name="Number of Cameras", min=1, default=60
+    )  # type: ignore
+
+    sampling_strategy: bpy.props.EnumProperty(        # 采样方法
+        name="Sampling Method",
         items=[
-            ("HEMI",    "Fibonacci (Upper-Hemisphere)", ""),
-            ("SPHERE",  "Fibonacci (Full-Sphere)",       ""),
+            ("HEMI",   "Fibonacci (Upper-Hemisphere)", ""),
+            ("SPHERE", "Fibonacci (Full-Sphere)",     ""),
         ],
         default="HEMI",
-    )# type: ignore
-    radius: bpy.props.FloatProperty(name="Sphere Radius", min=0.1, default=10.0)# type: ignore
-    target_point: bpy.props.FloatVectorProperty(
-        name="Target Point", subtype="TRANSLATION", default=(0.0, 0.0, 0.0)
-    )# type: ignore
+    )  # type: ignore
+
+    radius: bpy.props.FloatProperty(                  # 球面半径
+        name="Sampling Radius", min=0.1, default=10.0
+    )  # type: ignore
+
+    target_point: bpy.props.FloatVectorProperty(      # 视点
+        name="Look-at Point", subtype="TRANSLATION", default=(0.0, 0.0, 0.0)
+    )  # type: ignore
     camera_source: bpy.props.EnumProperty(
         name="Template",
         items=[
@@ -194,7 +204,8 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         name="Format", items=_import_items
     )# type: ignore
     import_dir: bpy.props.StringProperty(
-        name="Model Folder", subtype="DIR_PATH", default="//colmap_model"
+        name="Import Path", subtype="FILE_PATH", default="//",
+        description="Can be a folder (e.g. COLMAP model) or a calibration .json file"
     )# type: ignore
 
     # ---------- dataset generation ----------
@@ -224,7 +235,13 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
     progress: bpy.props.FloatProperty(name="Progress", min=0.0, max=1.0, default=0.0)# type: ignore
     is_running: bpy.props.BoolProperty(name="Generating", default=False)# type: ignore
     cameras_generated: bpy.props.BoolProperty(name="Cameras Ready", default=False)# type: ignore
-
+    # ---------- import scaling ----------
+    import_scale: bpy.props.FloatProperty(          # type: ignore
+        name="Scale",
+        min=0.0001,
+        default=1.0,
+        description="Multiply camera translation when importing",
+    )
 # --------------------------------------------------------------------------- #
 # Camera-split operator
 # --------------------------------------------------------------------------- #

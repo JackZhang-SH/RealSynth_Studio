@@ -12,6 +12,35 @@ from mathutils import Matrix, Quaternion, Vector
 
 __all__ = ["IMPORTER_REGISTRY", "BaseImporter"]
 
+# ──────────────────────────  Intrinsics helper  ────────────────────────── #
+def _apply_intrinsics(
+    camdat: bpy.types.Camera,
+    *,
+    w: int, h: int,
+    fx: float, fy: float,
+    cx: float, cy: float,
+    dist: dict[str, float] | None = None,
+    sensor_width: float = 36.0,          # 常用全幅等效
+):
+    """Write (fx, fy, cx, cy) ⟹ Blender camera, **preserving** values loss-lessly."""
+    camdat.type = 'PERSP'
+    camdat.sensor_fit = 'HORIZONTAL'          # 锁水平以免 Blender 自动缩放纵向
+    camdat.sensor_width = sensor_width
+    camdat.lens = fx * sensor_width / w       # 焦距(mm)
+
+    # 校正纵向焦距
+    camdat.sensor_height = sensor_width * h / w * fx / fy
+
+    # 主点偏移 → shift
+    camdat.shift_x = (cx / w) - 0.5           # +右  -左
+    camdat.shift_y = 0.5 - (cy / h)           # +上  -下（OpenCV⇄Blender）
+
+    # 持久化到自定义属性，便于导出阶段直接读取
+    camdat["fl_x"], camdat["fl_y"] = fx, fy
+    camdat["cx"],  camdat["cy"]    = cx, cy
+    if dist:
+        for k, v in dist.items():
+            camdat[k] = float(v)
 
 # ───────────────────── Base class ───────────────────── #
 class BaseImporter(ABC):
@@ -48,17 +77,30 @@ class BaseImporter(ABC):
 
     @staticmethod
     def _cv_to_blender_matrix(q: Quaternion, t: Vector) -> Matrix:
-        """COLMAP world→camera 外参 [R|t]  ➜ Blender camera→world 矩阵"""
-        blender2cv = Matrix((
-            (1, 0, 0, 0),
-            (0,-1, 0, 0),   # flip  Y
-            (0, 0,-1, 0),   # flip  Z
-            (0, 0, 0, 1),
-        ))
-        # 正确顺序：T @ R  →  [R | t]
+        # 1) COLMAP world → camera  (4×4)
         M_w2cv = Matrix.Translation(t) @ q.to_matrix().to_4x4()
-        # 取逆得到 camera→world (CV)，再转 Blender 坐标系
-        return M_w2cv.inverted() @ blender2cv
+
+        # 2) camera → world  (still in OpenCV axes)
+        M_cv2w = M_w2cv.inverted()
+
+        # 3) OpenCV world → Blender world  (A)
+        A = Matrix((
+            (1, 0,  0, 0),
+            (0, 0,  1, 0),
+            (0,-1,  0, 0),
+            (0, 0,  0, 1),
+        ))
+
+        # 4) Blender local → OpenCV local  (T)
+        T = Matrix((
+            (1, 0,  0, 0),
+            (0,-1,  0, 0),
+            (0, 0,-1, 0),
+            (0, 0,  0, 1),
+        ))
+
+        # 5) Compose:  Blender matrix_world
+        return A @ M_cv2w @ T
 
     def instantiate(
         self,
@@ -68,19 +110,27 @@ class BaseImporter(ABC):
         collection: bpy.types.Collection,
         color: Tuple[float, float, float, float],
     ):
-        from .operators import _ensure_marker  # 延迟导入避免循环
+        from .operators import _ensure_marker                   # late-import
+
+        s = bpy.context.scene.rs_settings
+        scale = getattr(s, "import_scale", 1.0)
 
         for idx, info in enumerate(cams):
-            cam_name = f"{name_prefix}_{start_index + idx}_train"
-            data = bpy.data.cameras.new(cam_name)
-            data.type = "PERSP"
-            angle_x = 2 * math.atan(info["w"] / (2 * info["fx"]))
-            data.angle = angle_x
-            data["fl_x"], data["fl_y"] = info["fx"], info["fy"]
+            name = f"{name_prefix}_{start_index+idx}_train"
+            camdat = bpy.data.cameras.new(name)
 
-            obj = bpy.data.objects.new(cam_name, data)
-            q = Quaternion(info["q"])  # (w,x,y,z)
-            t = Vector(info["t"])      # (x,y,z)
+            # --- 写入内参 ----------------------------------------------------
+            w, h  = info["w"],  info["h"]
+            fx,fy = info["fx"], info["fy"]
+            cx    = info.get("cx", w*0.5)
+            cy    = info.get("cy", h*0.5)
+            dist  = {k: info.get(k, 0.0) for k in ("k1","k2","p1","p2")}
+            _apply_intrinsics(camdat, w=w, h=h, fx=fx, fy=fy, cx=cx, cy=cy,
+                              dist=dist)
+
+            obj = bpy.data.objects.new(name, camdat)
+            q   = Quaternion(info["q"])
+            t   = Vector(info["t"]) * scale
             obj.matrix_world = self._cv_to_blender_matrix(q, t)
 
             collection.objects.link(obj)
@@ -144,6 +194,193 @@ class ColmapImporter(BaseImporter):
             )
         return out
 
+def _matrix_from_list(m):
+    from mathutils import Matrix
+    return Matrix(m)
+
+# ───────────────────── NGP ───────────────────── #
+class NGPImporter(BaseImporter):
+    format_name = "NGP"
+
+    # ---------- 解析 ---------- #
+    def parse(self, model_dir: Path):
+        import json
+        tf_files = list(model_dir.rglob("transforms*.json"))
+        if not tf_files:
+            raise FileNotFoundError("No transforms*.json found")
+
+        cams = []
+        for f in tf_files:
+            data = json.loads(f.read_text())
+            w, h   = data["w"],   data["h"]
+            fx, fy = data["fl_x"], data["fl_y"]
+            cx     = data.get("cx", w * 0.5)          # ≤ v4.4 作者输出里就有 cx/cy
+            cy     = data.get("cy", h * 0.5)
+
+            split  = ("test" if "test" in f.stem else
+                      "valid" if "val"  in f.stem else "train")
+
+            for fr in data["frames"]:
+                cams.append(dict(
+                    mat   = fr["transform_matrix"],
+                    w=w, h=h, fx=fx, fy=fy, cx=cx, cy=cy,
+                    split = split,
+                ))
+        return cams
+
+    # ---------- 实例化 ---------- #
+    def instantiate(self, cams, name_prefix, start_index, *_):
+        from .operators import _ensure_collections, _ensure_marker, SPLIT_COLORS
+        subcols = _ensure_collections()
+        scale   = bpy.context.scene.rs_settings.import_scale
+
+        for idx, info in enumerate(cams):
+            split  = info.get("split", "train")
+            col    = subcols[split]
+            color  = SPLIT_COLORS[split]
+            name   = f"{name_prefix}_{start_index+idx}_{split}"
+
+            camdat = bpy.data.cameras.new(name)
+            _apply_intrinsics(
+                camdat,
+                w = info["w"],   h = info["h"],
+                fx= info["fx"], fy= info["fy"],
+                cx= info["cx"], cy= info["cy"],
+            )
+
+            obj = bpy.data.objects.new(name, camdat)
+            mat = _matrix_from_list(info["mat"])
+            if scale != 1.0:
+                mat.translation *= scale
+            obj.matrix_world = mat
+
+            col.objects.link(obj)
+            _ensure_marker(obj, color, col)
+
+        return len(cams)
+
+
+class TACVImporter(BaseImporter):
+    format_name = "TACV"
+
+    # ---------- 解析 ---------- #
+    def parse(self, model_dir: Path):
+        import json
+        cams = []
+
+        def _add(fpath, split):
+            if not fpath.exists():
+                return
+            for item in json.loads(fpath.read_text()):
+                w, h   = item["w"],   item["h"]
+                fx, fy = item["fl_x"], item["fl_y"]
+                cx     = item.get("cx", w * 0.5)
+                cy     = item.get("cy", h * 0.5)
+
+                cams.append(dict(
+                    mat   = item["transform_matrix"],
+                    w=w, h=h, fx=fx, fy=fy, cx=cx, cy=cy,
+                    split = split,
+                ))
+
+        _add(model_dir / "transforms.json",       "train")
+        _add(model_dir / "transforms_valid.json", "valid")
+        _add(model_dir / "transforms_test.json",  "test")
+        if not cams:
+            raise FileNotFoundError("No transforms*.json found")
+        return cams
+
+    # ---------- 实例化 ---------- #
+    instantiate = NGPImporter.instantiate      # 逻辑完全一致
+
+# ───────────────────── NeRF Synthetic ───────────────────── #
+class NeRFSynthImporter(BaseImporter):
+    format_name = "NERF_SYNTH"
+
+    def parse(self, model_dir: Path):
+        import json, re
+        cams = []
+        for tf in model_dir.rglob("transforms_*.json"):
+            m = re.match(r"^transforms_(train|val|test)\.json$", tf.name)
+            if not m:
+                continue
+            split = {"train":"train", "val":"valid", "test":"test"}[m.group(1)]
+            data  = json.loads(tf.read_text())
+            w, h = data["w"], data["h"]
+            fx, fy = data["fl_x"], data["fl_y"]
+            for fr in data["frames"]:
+                cams.append(dict(
+                    mat   = fr["transform_matrix"],
+                    w=w, h=h, fx=fx, fy=fy,
+                    split = split,
+                ))
+        if not cams:
+            raise FileNotFoundError("No transforms_*.json found")
+        return cams
+
+    def instantiate(self, cams, name_prefix, start_index, *_):
+        from .operators import _ensure_collections, _ensure_marker, SPLIT_COLORS
+        subcols = _ensure_collections()
+        scale   = bpy.context.scene.rs_settings.import_scale
+        for idx, info in enumerate(cams):
+            split = info["split"]      # train / valid / test
+            col   = subcols[split]
+            color = SPLIT_COLORS[split]
+            name  = f"{name_prefix}_{start_index+idx}_{split}"
+
+            data = bpy.data.cameras.new(name)
+            data.type = 'PERSP'
+            data.angle = 2 * math.atan(info["w"] / (2 * info["fx"]))
+            data["fl_x"], data["fl_y"] = info["fx"], info["fy"]
+
+            obj = bpy.data.objects.new(name, data)
+            mat = _matrix_from_list(info["mat"])
+            if scale != 1.0:
+                mat.translation *= scale
+            obj.matrix_world = mat
+
+            col.objects.link(obj)
+            _ensure_marker(obj, color, col)
+            
+class CMUPanopticImporter(BaseImporter):
+    format_name = "CMU_PANOPTIC"
+
+    def parse(self, model_dir: Path):
+        import json
+        from mathutils import Matrix, Vector
+
+        # --- 找到 json ---
+        if model_dir.is_file():
+            json_path = model_dir
+        else:
+            cand = [p for p in model_dir.iterdir() if p.suffix == ".json"]
+            if not cand:
+                raise FileNotFoundError("No *.json calibration file found")
+            json_path = cand[0]
+
+        calib = json.loads(json_path.read_text())
+
+        cams = []
+        for cam in calib["cameras"]:
+            w, h = cam["resolution"]
+            K    = cam["K"]                        # 3×3
+            fx, fy = K[0][0], K[1][1]
+            cx, cy = K[0][2], K[1][2]
+
+            R_mat  = Matrix(cam["R"])
+            q      = R_mat.to_quaternion()         # (w,x,y,z)
+
+            t_arr  = cam["t"]                      # [[x],[y],[z]]
+            t_vec  = Vector((t_arr[0][0], t_arr[1][0], t_arr[2][0]))
+
+            cams.append(dict(
+                q=q, t=t_vec,
+                w=w, h=h,
+                fx=fx, fy=fy, cx=cx, cy=cy,
+            ))
+        if not cams:
+            raise ValueError("No camera entries found in calibration JSON")
+        return cams
 
 # ───────────────────── Registry ───────────────────── #
 IMPORTER_REGISTRY: Dict[str, BaseImporter] = {}
@@ -154,3 +391,7 @@ def _register_importer(cls: type[BaseImporter]):
 
 # 把 COLMAP 注册进去
 _register_importer(ColmapImporter)
+_register_importer(NeRFSynthImporter)
+_register_importer(NGPImporter)
+_register_importer(TACVImporter)
+_register_importer(CMUPanopticImporter)

@@ -37,7 +37,28 @@ import bpy
 import bpy.path as bpath
 from mathutils import Vector
 from enum import Enum, auto
+# ------------------------------------------------------------------ NEW ---- #
+# core.py ────────────────────────────────────────────────────────────
+def _intrinsics_from_cam(camdat: bpy.types.Camera, scene: bpy.types.Scene):
+    """Extract w,h,fx,fy,cx,cy,dist from *camdat* **without** losing precision."""
+    scale = scene.render.resolution_percentage / 100.0
+    w = scene.render.resolution_x * scale
+    h = scene.render.resolution_y * scale
 
+    fx = float(camdat.get("fl_x", 0.5 * w / math.tan(camdat.angle_x * 0.5)))
+    fy = float(camdat.get("fl_y", 0.5 * h / math.tan(camdat.angle_y * 0.5)))
+
+
+    if "cx" in camdat.keys() and "cy" in camdat.keys():
+        cx = float(camdat["cx"])
+        cy = float(camdat["cy"])
+    else:                                       # fallback: derive from shifts
+        cx = (0.5 + camdat.shift_x) * w
+        cy = (0.5 - camdat.shift_y) * h
+    # ───── REPLACE ↑ 这一段 ─────
+
+    dist = {k: float(camdat.get(k, 0.0)) for k in ("k1", "k2", "p1", "p2")}
+    return w, h, fx, fy, cx, cy, dist
 # ──────────────────────────────────────────────────────────── #
 #  New: export-format enumeration
 # ──────────────────────────────────────────────────────────── #
@@ -128,28 +149,24 @@ class NGPDatasetWriter(DatasetWriter):
 
 
     def finish(self):
-        rs = bpy.context.scene.rs_settings
-        aabb = getattr(rs, "aabb_scale", 2)        # 用户可在 UI 里设
+        scene = bpy.context.scene
+        w, h, fx, fy, cx, cy, dist = _intrinsics_from_cam(self.cam0, scene)
+        aabb = scene.rs_settings.aabb_scale
 
-        # 若相机 data 上没有这些自定义属性就自动填 0
-        dist = {k: float(self.cam0.get(k, 0.0)) for k in ("k1","k2","p1","p2")}
-        fx, fy = self.fx, self.fy        # ← now strictly from cam0
         for frame, frames_meta in self._per_frame_meta.items():
             out = {
                 "camera_angle_x": self.cam0.angle_x,
                 "camera_angle_y": self.cam0.angle_y,
                 "fl_x": fx, "fl_y": fy,
-                **dist,                         # k1 k2 p1 p2
-                "cx":   self.w * 0.5,
-                "cy":   self.h * 0.5,
-                "w": self.w, "h": self.h,
-                "aabb_scale": aabb,            # ★ 新增
-                "scale":  self._scale,   # record for downstream tools
+                **dist,
+                "cx": cx, "cy": cy,
+                "w":  w,  "h":  h,
+                "aabb_scale": aabb,
+                "scale": self._scale,
                 "frames": frames_meta,
             }
-            (self.root / f"frame_{frame}" / "transforms.json").write_text(
-                json.dumps(out, indent=4)
-            )
+            (self.root / f"frame_{frame}"
+             / "transforms.json").write_text(json.dumps(out, indent=4))
 
 
     
@@ -206,12 +223,13 @@ class NeRFSyntheticWriter(DatasetWriter):
         })
 
     def finish(self):
+        w,h,fx,fy,cx,cy,_ = _intrinsics_from_cam(self.cam0, bpy.context.scene)
         common = {
             "camera_angle_x": self.cam0.angle_x,
             "camera_angle_y": self.cam0.angle_y,
-            "fl_x": self.fx, "fl_y": self.fy,
-            "cx":  self.w * 0.5, "cy": self.h * 0.5,
-            "w":   self.w,       "h":  self.h,
+            "fl_x": fx, "fl_y": fy,
+            "cx": cx,  "cy": cy,
+            "w":  w,   "h":  h,
         }
 
         for frame, split_dict in self._frames.items():
@@ -264,43 +282,28 @@ class TACVDatasetWriter(DatasetWriter):
         return frame_dir / filename
 
     def register_frame(self, cam_obj, rel_path):
-        frame  = self._scene.frame_current
-        split  = self._split_of(cam_obj)            # 'train' | 'test'
-        camdat = cam_obj.data
-        scene  = self._scene
+        frame = self._scene.frame_current
+        split = "test" if cam_obj.name.endswith("_test") else "train"
 
-        # --- 分辨率 & 像素焦距 -------------------------------------------------
-        scale = scene.render.resolution_percentage / 100.0
-        w = scene.render.resolution_x * scale
-        h = scene.render.resolution_y * scale
-
-        fx = 0.5 * w / math.tan(camdat.angle_x * 0.5)
-        fy = 0.5 * h / math.tan(camdat.angle_y * 0.5)
-
-        # --- 畸变系数（若无则记 0.0） -----------------------------------------
-        dist = {k: float(camdat.get(k, 0.0)) for k in self._DIST_KEYS}
+        w,h,fx,fy,cx,cy,dist = _intrinsics_from_cam(cam_obj.data, self._scene)
         prefix = f"frame_{frame}/"
         local_fp = rel_path[len(prefix):] if rel_path.startswith(prefix) else rel_path
-        if not local_fp.startswith("./"):
-            local_fp = "./" + local_fp   # => "./train/1.png"
-        item = {
-            "camera_angle_x": camdat.angle_x,
-            "camera_angle_y": camdat.angle_y,
-            "fl_x": fx,
-            "fl_y": fy,
-            **dist,
-            "cx": w * 0.5,
-            "cy": h * 0.5,
-            "w":  w,
-            "h":  h,
-            "aabb_scale": 2,
-            "scale":       self._scale,
-            "transform_matrix": self._matrix(cam_obj.matrix_world),
-            "file_path":  local_fp               # e.g. "train/0.png"
-        }
+        if not local_fp.startswith("./"): local_fp = "./"+local_fp
 
-        coll = self._test if split == "test" else self._train
-        coll.setdefault(frame, []).append(item)
+        item = {
+            "camera_angle_x": cam_obj.data.angle_x,
+            "camera_angle_y": cam_obj.data.angle_y,
+            "fl_x": fx, "fl_y": fy,
+            **dist,
+            "cx": cx, "cy": cy,
+            "w": w, "h": h,
+            "aabb_scale": 2,
+            "scale": self._scale,
+            "transform_matrix": self._matrix(cam_obj.matrix_world),
+            "file_path": local_fp,
+        }
+        (self._test if split=="test" else self._train)\
+            .setdefault(frame, []).append(item)
 
     # 写文件：一个 frame 一对 transforms*.json ------------------------------- #
     def finish(self):
@@ -344,25 +347,39 @@ class ColmapPoseWriter(DatasetWriter):
     # ------------------------------------------------------------ helpers ----
     def _blender_to_colmap(self, cam_obj: bpy.types.Object):
         """
-        Convert Blender camera pose (camera-to-world) into COLMAP world-to-camera:
-        Returns (qw, qx, qy, qz, tx, ty, tz).
+        Convert *Blender* camera-to-world (matrix_world) into COLMAP
+        world-to-camera (OpenCV 左手系) 7-tuple:
+            (qw, qx, qy, qz, tx, ty, tz)
+        The math is the exact逆变换 of the importer’s
+            M_bl  =  A · (M_w2cv)⁻¹ · T
+        so that round-tripping poses is lossless.
         """
         import mathutils as mu
 
-        M_c2w = cam_obj.matrix_world
-        # Blender → CV 右手系变换：+Y↓, +Z-forward
-        blender2cv = mu.Matrix((
-            (1, 0, 0, 0),
-            (0,-1, 0, 0),
+        # Blender matrix_world  (camera → Blender-world)
+        M_bl = cam_obj.matrix_world
+
+        # ── constant axis-conversion matrices (same as importer) ────────────
+        A = mu.Matrix((
+            (1, 0,  0, 0),   # OpenCV-world → Blender-world
+            (0, 0,  1, 0),
+            (0,-1,  0, 0),
+            (0, 0,  0, 1),
+        ))
+        T = mu.Matrix((
+            (1, 0,  0, 0),   # Blender-local → OpenCV-local
+            (0,-1,  0, 0),
             (0, 0,-1, 0),
-            (0, 0, 0, 1),
+            (0, 0,  0, 1),
         ))
 
-        M_cv2w = M_c2w @ blender2cv
-        M_w2cv = M_cv2w.inverted()          # world → camera (CV)
+        # M_w2cv  =  T · M_bl⁻¹ · A
+        M_w2cv = T @ M_bl.inverted() @ A
+
         R = M_w2cv.to_3x3()
-        t = M_w2cv.to_translation() * self._scale
-        q = R.to_quaternion()               # (w, x, y, z)
+        t = M_w2cv.to_translation() * self._scale     # 可选全局缩放
+        q = R.to_quaternion()                         # (w, x, y, z)
+
         return (q.w, q.x, q.y, q.z, t.x, t.y, t.z)
 
     # ------------------------------------------------ dataset-writer API -----
