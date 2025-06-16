@@ -39,7 +39,7 @@ logger.setLevel(logging.INFO)
 # --------------------------------------------------------------------------- #
 # Import sub-modules (hot reload friendly)
 # --------------------------------------------------------------------------- #
-SUBMODULES = ("core", "operators", "ui")
+SUBMODULES = ("core", "operators", "ui", "lighting")
 for mod_name in SUBMODULES:
     if (mod := globals().get(mod_name)) is not None:
         importlib.reload(mod)
@@ -48,8 +48,8 @@ for mod_name in SUBMODULES:
 
 from .operators import CLASSES as OPERATOR_CLASSES, RSDatasetSettings  # noqa: E402
 from .ui import CLASSES as UI_CLASSES  # noqa: E402
-
-_ALL_CLASSES: List[Type] = [*OPERATOR_CLASSES, *UI_CLASSES]
+from .lighting import CLASSES as LIGHTING_CLASSES    
+_ALL_CLASSES: List[Type] = [*OPERATOR_CLASSES, *UI_CLASSES, *LIGHTING_CLASSES]
 
 # --------------------------------------------------------------------------- #
 # Register / Unregister
@@ -58,6 +58,7 @@ def register() -> None:
     for cls in _ALL_CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.rs_settings = bpy.props.PointerProperty(type=RSDatasetSettings)
+    bpy.types.Scene.rs_light    = bpy.props.PointerProperty(type=LIGHTING_CLASSES[0])
     logger.info("RealSynth Dataset Studio registered")
 
 

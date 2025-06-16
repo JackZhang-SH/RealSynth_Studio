@@ -30,7 +30,7 @@ from typing import Optional, Dict, Tuple
 import bpy
 import bpy.path as bpath
 from mathutils import Vector, Quaternion, Matrix
-
+from bpy.props import BoolProperty   
 from .importers import IMPORTER_REGISTRY
 from .core import (
     DatasetGenerator,
@@ -242,6 +242,16 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         default=1.0,
         description="Multiply camera translation when importing",
     )
+    scan_fix_scale: BoolProperty(# type: ignore
+        name="Apply Scale",
+        description="Apply object scale so that 1 BU = 1 m",
+        default=True,
+    )# type: ignore
+    scan_fix_material: BoolProperty(# type: ignore
+        name="Repair Material",
+        description="Auto-build (or patch) Principled-BSDF with textures",
+        default=True,
+    )# type: ignore
 # --------------------------------------------------------------------------- #
 # Camera-split operator
 # --------------------------------------------------------------------------- #
@@ -585,6 +595,133 @@ class RS_OT_CancelGeneration(bpy.types.Operator):
         self.report({"INFO"}, "No generation job is currently running")
         return {"CANCELLED"}
 
+# --------------------------------------------------------------------------- #
+# ---------------------------------- helper --------------------------------- #
+def _has_paired_tex_to_principled(mat: bpy.types.Material) -> bool:
+    """Return True if there is at least one ImageTexture linked to Principled"""
+    if not mat.use_nodes:
+        return False
+    for n in mat.node_tree.nodes:
+        if n.type == "BSDF_PRINCIPLED":
+            for link in n.inputs["Base Color"].links:
+                if link.from_node.type == "TEX_IMAGE":
+                    return True
+    return False
+
+
+def _smart_pbr(mat: bpy.types.Material) -> None:
+    """Only build/repair when材质缺失或未正确连线"""
+    mat.use_nodes = True
+    nt, nodes, links = mat.node_tree, mat.node_tree.nodes, mat.node_tree.links
+
+    if _has_paired_tex_to_principled(mat):
+        # 材质 already ok – nothing to do
+        return
+
+    # ========== rebuild or patch ==========
+    tex_nodes = [n for n in nodes if n.type == "TEX_IMAGE"]
+    principled = next((n for n in nodes if n.type == "BSDF_PRINCIPLED"), None)
+
+    # ① 若无 Principled，则创建
+    if principled is None:
+        principled = nodes.new("ShaderNodeBsdfPrincipled")
+        principled.location = (0, 0)
+
+    # ② 若未连贴图，则把第一张贴图接 base-color & alpha
+    if tex_nodes:
+        tex = tex_nodes[0]
+        links.new(tex.outputs.get("Color"), principled.inputs["Base Color"])
+        if tex.outputs.get("Alpha"):
+            links.new(tex.outputs["Alpha"], principled.inputs["Alpha"])
+
+    # ③ 保证 Material Output
+    out = next((n for n in nodes if n.type == "OUTPUT_MATERIAL"), None)
+    if out is None:
+        out = nodes.new("ShaderNodeOutputMaterial")
+        out.location = (300, 0)
+    # ④ 连线
+    if not principled.outputs["BSDF"].is_linked:
+        links.new(principled.outputs["BSDF"], out.inputs["Surface"])
+
+# --------------------------------------------------------------------------- #
+# Organise imported scan model(s)                                              #
+# --------------------------------------------------------------------------- #
+class RS_OT_OrganizeScan(bpy.types.Operator):
+    """Move selected scan objects to *Scans/Models*, apply unit-scale,
+    and give every mesh a clean Principled-BSDF material."""
+    bl_idname  = "rs.organize_scan"
+    bl_label   = "Organize Scan Model"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def _ensure_scan_collection(self) -> bpy.types.Collection:
+        root = bpy.data.collections.get("Scans")
+        if root is None:
+            root = bpy.data.collections.new("Scans")
+            bpy.context.scene.collection.children.link(root)
+
+        models = root.children.get("Models")
+        if models is None:
+            models = bpy.data.collections.new("Models")
+            root.children.link(models)
+        return models
+
+    # ------------------------------------------------------------------ run #
+    def execute(self, context):
+        models_col = self._ensure_scan_collection()
+        selected   = [o for o in context.selected_objects]
+
+        if not selected:
+            self.report({"WARNING"}, "Nothing selected")
+            return {"CANCELLED"}
+
+        # Work in Object mode
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        # Backup current selection
+        orig_sel = set(context.selected_objects)
+
+        for obj in selected:
+            # 1) link / relink to Scans/Models collection
+            if models_col not in obj.users_collection:
+                models_col.objects.link(obj)
+            for c in obj.users_collection[:]:
+                if c != models_col:
+                    c.objects.unlink(obj)
+
+            # 2) apply scale so that scale = (1,1,1)
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            if obj.type == 'MESH':
+                bpy.ops.object.transform_apply(location=False,
+                                               rotation=False,
+                                               scale=True)
+            obj.select_set(False)
+
+            # 3) ensure Principled-BSDF material
+            if obj.type == 'MESH':
+                if not obj.data.materials:
+                    mat = bpy.data.materials.new("ScanMaterial")
+                    _smart_pbr(mat)
+                    obj.data.materials.append(mat)
+                else:
+                    for mat in obj.data.materials:
+                        if mat is None:
+                            mat = bpy.data.materials.new("ScanMaterial")
+                            obj.data.materials.append(mat)
+                        _smart_pbr(mat)
+
+        # restore previous selection
+        for o in orig_sel:
+            o.select_set(True)
+
+        self.report({'INFO'}, f"Organised {len(selected)} object(s)")
+        return {'FINISHED'}
+
+# --------------------------------------------------------------------------- #
+# Register new operator                                                       #
+# --------------------------------------------------------------------------- #
 
 # --------------------------------------------------------------------------- #
 # Global pointer to active generator
@@ -603,4 +740,5 @@ CLASSES = [
     RS_OT_ClearCameras,
     RS_OT_SetCameraSplit,
     RS_OT_ImportCameras,    
+    RS_OT_OrganizeScan,
 ]

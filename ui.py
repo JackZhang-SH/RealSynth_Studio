@@ -11,6 +11,7 @@ from .operators import (
     RS_OT_SetCameraSplit,
     RS_OT_GenerateDataset,
     RS_OT_CancelGeneration,
+    RS_OT_OrganizeScan,  
 )
 
 CLASSES: list[type] = []
@@ -47,7 +48,41 @@ class RS_PT_MainPanel(bpy.types.Panel):
         imp.operator("rs.import_cameras", icon='IMPORT')
 
         layout.separator()
+        # ─────────────── Lighting (new) ─────────────── #
+        light = layout.box()
+        light.label(text="Lighting", icon='LIGHT_SUN')
 
+        light.prop(s2 := context.scene.rs_light, "location", expand=True)
+        light.prop(s2, "weather")
+
+        # weather-specific sliders
+        if s2.weather in {"CLEAR", "SCATTERED", "OVERCAST"}:
+            light.prop(s2, "cloudiness", slider=True)
+        elif s2.weather == "RAIN":
+            light.prop(s2, "rain_intensity", slider=True)
+        elif s2.weather == "FOG":
+            light.prop(s2, "fog_density", slider=True)
+
+        light.separator()
+
+        col = light.column(align=True)
+        col.use_property_split = True           # 左右分栏：标签 / 控件
+        col.prop(s2, "date",       text="Date")
+        col.prop(s2, "hour",       text="Hour (0-24)")
+
+        # 清晰分组经纬度
+        col.label(text="Geographic Location")
+        row = col.row(align=True)
+        row.prop(s2, "latitude")
+        row.prop(s2, "longitude")
+
+        # ─────────────── Post-Import Organiser ─────────────── #
+        org = layout.box()
+        org.label(text="Scan Post-Import", icon='FILE_REFRESH')
+        row = org.row(align=True)
+        row.operator("rs.organize_scan", icon='FILE_REFRESH')
+        row.prop(s, "scan_fix_scale", text="Scale ↔ 1 m")
+        row.prop(s, "scan_fix_material", text="Fix Material")
         # ─────────────── Camera Rig ─────────────── #
         cam_box = layout.box()
         cam_box.label(text="Camera Generator", icon='CAMERA_DATA')
