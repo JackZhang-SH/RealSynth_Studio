@@ -65,17 +65,22 @@ class RS_PT_MainPanel(bpy.types.Panel):
 
         light.separator()
 
-        col = light.column(align=True)
-        col.use_property_split = True           # 左右分栏：标签 / 控件
-        col.prop(s2, "date",       text="Date")
-        col.prop(s2, "hour",       text="Hour (0-24)")
+        if s2.location == "OUTDOOR":
+            col = light.column(align=True)
+            col.use_property_split = True
 
-        # 清晰分组经纬度
-        col.label(text="Geographic Location")
-        row = col.row(align=True)
-        row.prop(s2, "latitude")
-        row.prop(s2, "longitude")
+            # 日期 & 小时（小时带滑条，步长 0.25 h）
+            col.prop(s2, "date", text="Date")
+            col.prop(s2, "hour", text="Local Time (h)", slider=True)
 
+            # 经纬度两行分开，滑条 ±90 / ±180
+            col.prop(s2, "latitude",  text="Latitude (°)",  slider=True)
+            col.prop(s2, "longitude", text="Longitude (°)", slider=True)
+
+            # 时区提示
+            tz_off = s2.longitude / 15.0
+            light.label(text=f"Local TZ ≈ UTC{tz_off:+.1f} h")
+        light.operator("rs.apply_lighting", icon='CHECKMARK')
         # ─────────────── Post-Import Organiser ─────────────── #
         org = layout.box()
         org.label(text="Scan Post-Import", icon='FILE_REFRESH')

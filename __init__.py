@@ -10,7 +10,10 @@ import logging
 from typing import List, Type
 
 import bpy
-
+import os, sys as _sys
+_libs = os.path.join(os.path.dirname(__file__), "libs")
+if _libs not in _sys.path:
+    _sys.path.append(_libs)
 print("RealSynth Dataset Studio – modules reloaded")
 
 # --------------------------------------------------------------------------- #
