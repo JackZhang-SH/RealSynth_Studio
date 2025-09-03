@@ -221,7 +221,7 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
             ("NERF_SYNTH",   "NeRF Synthetic",     ""),
             ("TACV",         "TACV",               ""),
             ("COLMAP_POSES", "COLMAP (poses)",     ""),
-            ("COLMAP_3DGS",  "3DGS (COLMAP)",      ""),
+            ("COLMAP_3DGS_MESH", "3DGS (COLMAP, Surface)", ""), # ← NEW
         ],
         default="NGP",
     )# type: ignore
@@ -252,6 +252,63 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         description="Auto-build (or patch) Principled-BSDF with textures",
         default=True,
     )# type: ignore
+    # ---- depth-fusion point cloud params (for COLMAP_3DGS export) ----
+    depth_stride: bpy.props.IntProperty(            # type: ignore
+        name="Depth Stride (px)",
+        min=1, default=4,
+        description="Sample every N pixels when back-projecting depth"
+    )
+    pointcloud_voxel: bpy.props.FloatProperty(      # type: ignore
+        name="Voxel Size (m)",
+        min=1e-5, default=0.01,
+        description="Voxel size for voxel-grid fusion in meters"
+    )
+    pointcloud_max_points: bpy.props.IntProperty(   # type: ignore
+        name="Max Points",
+        min=1, default=2_000_000,
+        description="Upper bound on fused points (controls memory/time)"
+    )
+    mesh_points_target: bpy.props.IntProperty(     # type: ignore
+        name="Target Points",
+        min=1, default=800_000,
+        description="Target number of points after voxel merge"
+    )
+    mesh_voxel: bpy.props.FloatProperty(           # type: ignore
+        name="Voxel Size (m)",
+        min=1e-5, default=0.01,
+        description="Voxel size for surface-sampling merge in meters"
+    )
+    mesh_visibility_filter: bpy.props.BoolProperty(  # type: ignore
+        name="Visibility Filter",
+        default=True,
+        description="Keep points only if visible from cameras"
+    )
+    mesh_min_visible_cameras: bpy.props.IntProperty( # type: ignore
+        name="Min Visible Cams",
+        min=1, max=999, default=1,
+        description="A point must be visible from at least this many cameras"
+    )
+    mesh_backface_cull: bpy.props.BoolProperty(      # type: ignore
+        name="Backface Cull",
+        default=True,
+        description="Discard samples whose normal faces away from camera"
+    )
+    mesh_max_cameras_check: bpy.props.IntProperty(   # type: ignore
+        name="Max Cams to Check",
+        min=1, default=12,
+        description="Upper bound of cameras tested for visibility (speed)"
+    )
+    mesh_color_mode: bpy.props.EnumProperty(         # type: ignore
+        name="Color Source",
+        items=[
+            ("TEXTURE",  "Albedo from Texture (UV)", ""),
+            ("VCOL",     "Vertex Color",              ""),
+            ("MATERIAL", "Material Base Color",       ""),
+            ("WHITE",    "White",                     ""),
+        ],
+        default="TEXTURE",
+        description="How to derive per-point color"
+    )
 # --------------------------------------------------------------------------- #
 # Camera-split operator
 # --------------------------------------------------------------------------- #

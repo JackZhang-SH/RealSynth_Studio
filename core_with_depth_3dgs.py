@@ -38,11 +38,14 @@ import bpy
 import bpy.path as bpath
 from mathutils import Vector
 from enum import Enum, auto
+# ---------- small helpers: plane fit & (de)projection ----------
+
 import json, math, random
 from pathlib import Path
 import numpy as np
 import bpy
 from mathutils import Vector, Matrix
+
 def fit_plane_svd(pts_xyz: np.ndarray):
     """
     Fit a plane n^T (x - c) = 0 by SVD.
@@ -116,6 +119,242 @@ def project_cv(K, R_wc, C_w, Xw):
     Zc = Xc[:,2].copy()
     uv1 = (K @ (Xc.T / np.clip(Zc, 1e-12, None))).T
     return uv1[:,0], uv1[:,1], Zc
+
+# ---------- main diagnostics: per-camera plane normals & deltas ----------
+
+def debug_report_depth_planes(root_out: Path, frame: int, items, *,
+                              max_cam=8,  # limit cameras for speed
+                              step=8,     # sampling stride on the image grid
+                              max_samples_per_cam=40000,
+                              write_ply=True):
+    """
+    For each camera in `items` (the same list received by _fuse_points_for_frame),
+    back-project a sparse grid using the current math, then:
+      - Fit a plane (SVD) -> normal, RMS
+      - Reproject back -> RMSE in pixels
+      - Repeat under toggles to see which factor bends the plane:
+          transform_mode: 'matrix_world' vs 'Rt'
+          depth_mode:     'Z' vs 'RAY' (convert ray length to Zc)
+          use_half_pixel: True vs False
+    A combined JSON report is written to frame_{frame}/debug_backproj_report.json
+    and optional per-camera PLY files are saved for visualization.
+    """
+    import mathutils as mu
+    scn = bpy.context.scene
+    frame_dir = Path(root_out) / f"frame_{frame}"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    # scene pixel aspect for sanity
+    pasx = float(scn.render.pixel_aspect_x)
+    pasy = float(scn.render.pixel_aspect_y)
+
+    # toggles we will sweep
+    transform_modes = ["matrix_world", "Rt"]
+    depth_modes     = ["Z", "RAY"]
+    half_pixel_opts = [True, False]
+
+    # utility to load pixels (Non-Color) and return numpy arrays
+    def load_np_pixels(img_path):
+        img = bpy.data.images.load(os.fspath(img_path), check_existing=True)
+        try:
+            img.use_view_as_render = False
+            img.colorspace_settings.name = "Non-Color"
+        except Exception:
+            pass
+        w, h = img.size[0], img.size[1]
+        ch = int(getattr(img, "channels", 4) or 4)
+        px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, ch)  # Blender stores bottom→top
+        bpy.data.images.remove(img)
+        return px, w, h, ch
+
+    # collect (color_path -> depth_path) used in this frame (same as exporter)
+    # We reconstruct expected depth paths from filename convention
+    color2depth = {}
+    for cam_obj, img_rel in items:
+        color_abs = (Path(root_out) / img_rel).resolve()
+        # depth alongside: frame_X/depth/f####_c####.exr
+        # Resolve any suffix Blender may add.
+        depth_dir = color_abs.parents[1] / "depth"
+        stem = f"f{frame:04d}_c{int(color_abs.stem):04d}"
+        cand = sorted(depth_dir.glob(stem + "*.exr"))
+        if cand:
+            color2depth[color_abs] = cand[-1]
+
+    report = {
+        "frame": frame,
+        "pixel_aspect": [pasx, pasy],
+        "cameras": []
+    }
+
+    # iterate cameras
+    for idx, (cam_obj, img_rel) in enumerate(items[:max_cam]):
+        color_abs = (Path(root_out) / img_rel).resolve()
+        depth_abs = color2depth.get(color_abs)
+        if depth_abs is None or not depth_abs.exists():
+            continue
+
+        dep_np, w, h, dep_ch = load_np_pixels(depth_abs)
+        # depth channel: take the first channel [.., .., 0]
+        dep_np = dep_np[..., 0]
+
+        # intrinsics
+        w0,h0,fx,fy,cx,cy,_ = _intrinsics_from_cam(cam_obj.data, scn)
+        if int(w0) != int(w) or int(h0) != int(h):
+            fx *= (w / w0);  fy *= (h / h0)
+            cx *= (w / w0);  cy *= (h / h0)
+
+        # extrinsics
+        # Replace the "static-like" call with explicit math that does not depend on self._scale
+        M_bl = cam_obj.matrix_world
+        A = mu.Matrix((
+            (1, 0,  0, 0),  # OpenCV-world → Blender-world
+            (0, 0,  1, 0),
+            (0,-1,  0, 0),
+            (0, 0,  0, 1),
+        ))
+        T = mu.Matrix((
+            (1, 0,  0, 0),  # Blender-local → OpenCV-local
+            (0,-1,  0, 0),
+            (0, 0,-1, 0),
+            (0, 0,  0, 1),
+        ))
+        M_w2cv = T @ M_bl.inverted() @ A
+        R_cw = np.array(M_w2cv.to_3x3(), dtype=np.float64)
+        R_wc = R_cw.T
+        t_cw = np.array(M_w2cv.to_translation(), dtype=np.float64) * 1.0  # keep debug free of global scale
+        C_w  = -R_wc @ t_cw
+        Mw = np.array(cam_obj.matrix_world, dtype=np.float64)
+
+        # sample pixels
+        uu = np.arange(0, w, max(1, step))
+        vv = np.arange(0, h, max(1, step))
+        samp = [(int(u), int(v)) for v in vv for u in uu]
+        random.shuffle(samp)
+        samp = samp[:max_samples_per_cam]
+
+        cam_entry = {
+            "name": cam_obj.name,
+            "image": os.fspath(color_abs),
+            "depth": os.fspath(depth_abs),
+            "w": int(w), "h": int(h),
+            "fx": float(fx), "fy": float(fy), "cx": float(cx), "cy": float(cy),
+            "metrics": []
+        }
+
+        for transform_mode in transform_modes:
+            for depth_mode in depth_modes:
+                for use_half_pixel in half_pixel_opts:
+                    pts_world = []
+                    uv_used   = []
+
+                    # back-project
+                    for (u, v) in samp:
+                        # read depth from Blender's bottom→top buffer
+                        vi = h - 1 - v
+                        Z = float(dep_np[vi, u])
+                        if not (cam_obj.data.clip_start < Z < cam_obj.data.clip_end):
+                            continue
+
+                        u_c = u + (0.5 if use_half_pixel else 0.0)
+                        v_c = v + (0.5 if use_half_pixel else 0.0)
+                        sx = (u_c - cx) / fx
+                        sy = (v_c - cy) / fy
+
+                        if depth_mode == "RAY":  # interpret depth as ray length L
+                            rl = math.sqrt(1.0 + sx*sx + sy*sy)
+                            Zc = Z / rl
+                        else:                    # interpret depth as projection depth Zc
+                            Zc = Z
+
+                        Xc, Yc = sx*Zc, sy*Zc
+                        if transform_mode == "matrix_world":
+                            # OpenCV->Blender local: (Xb,Yb,Zb)=(Xc,-Yc,-Zc)
+                            Xb, Yb, Zb = Xc, -Yc, -Zc
+                            Pw = (Mw @ np.array([Xb, Yb, Zb, 1.0])).ravel()
+                            Xw, Yw, Zw = Pw[0], Pw[1], Pw[2]
+                        else:  # "Rt"
+                            Xw, Yw, Zw = (R_wc @ np.array([Xc, Yc, Zc])) + C_w
+
+                        pts_world.append([Xw, Yw, Zw])
+                        uv_used.append([u_c, v_c])
+
+                    if len(pts_world) < 100:
+                        continue
+
+                    P = np.asarray(pts_world, dtype=np.float64)
+                    U = np.asarray(uv_used, dtype=np.float64)
+
+                    # plane fit
+                    c, n, rms = fit_plane_svd(P)
+
+                    # reprojection error with the same intrinsics/extrinsics
+                    K = build_K(fx, fy, cx, cy)
+                    u_hat, v_hat, Zc_hat = project_cv(K, R_wc, C_w, P)
+                    E = np.sqrt((u_hat - U[:,0])**2 + (v_hat - U[:,1])**2)
+                    rmse = float(np.sqrt(np.mean(E**2)))
+                    q95  = float(np.percentile(E, 95.0))
+
+                    # pack metrics
+                    cam_entry["metrics"].append({
+                        "transform_mode": transform_mode,
+                        "depth_mode": depth_mode,
+                        "use_half_pixel": bool(use_half_pixel),
+                        "num_points": int(P.shape[0]),
+                        "plane_normal": [float(n[0]), float(n[1]), float(n[2])],
+                        "plane_rms": rms,
+                        "reproj_rmse_px": rmse,
+                        "reproj_q95_px": q95
+                    })
+
+                    # optional: write per-camera PLY for quick visual check
+                    if write_ply:
+                        ply_path = frame_dir / f"debug_cam_{cam_obj.name}_{transform_mode}_{depth_mode}_{'half' if use_half_pixel else 'nohalf'}.ply"
+                        with open(ply_path, "w", encoding="ascii") as f:
+                            f.write("ply\nformat ascii 1.0\n")
+                            f.write(f"element vertex {P.shape[0]}\n")
+                            f.write("property float x\nproperty float y\nproperty float z\n")
+                            f.write("end_header\n")
+                            for x,y,z in P:
+                                f.write(f"{x} {y} {z}\n")
+
+        report["cameras"].append(cam_entry)
+
+    # pairwise normal angles for best settings (choose the combo with min reproj RMSE per cam)
+    def best_metric(entry):
+        return min(entry["metrics"], key=lambda m: (m["reproj_rmse_px"], m["plane_rms"]))
+
+    normals = []
+    for cam_e in report["cameras"]:
+        bm = best_metric(cam_e)
+        normals.append((cam_e["name"], np.array(bm["plane_normal"], dtype=np.float64)))
+
+    pairwise = []
+    for i in range(len(normals)):
+        for j in range(i+1, len(normals)):
+            a_name, a_n = normals[i]
+            b_name, b_n = normals[j]
+            cosang = np.clip(float(a_n @ b_n) / (np.linalg.norm(a_n)*np.linalg.norm(b_n) + 1e-12), -1.0, 1.0)
+            ang = float(np.degrees(np.arccos(abs(cosang))))  # abs to ignore normal flips
+            pairwise.append({"a": a_name, "b": b_name, "angle_deg": ang})
+    report["pairwise_best_normal_angles_deg"] = pairwise
+
+    # write JSON
+    out_json = frame_dir / "debug_backproj_report.json"
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    # console summary
+    print("\n[RS-Studio][DEBUG] Depth back-projection diagnostics")
+    print("  Pixel aspect (x,y):", pasx, pasy)
+    for cam_e in report["cameras"]:
+        bm = best_metric(cam_e)
+        print(f"  Cam {cam_e['name']}: best transform={bm['transform_mode']}, depth={bm['depth_mode']}, half={bm['use_half_pixel']}, "
+              f"n={bm['num_points']}  plane_rms={bm['plane_rms']:.6f}  reproj_rmse={bm['reproj_rmse_px']:.4f}px")
+    for r in report["pairwise_best_normal_angles_deg"]:
+        print(f"    Angle({r['a']}, {r['b']}) = {r['angle_deg']:.6f} deg")
+    print(f"  -> JSON report: {out_json}\n")
+# ------------------------------------------------------------------ NEW ---- #
+# core.py ────────────────────────────────────────────────────────────
 def _intrinsics_from_cam(camdat, scene):
     scale = scene.render.resolution_percentage / 100.0
     w = scene.render.resolution_x * scale
@@ -139,7 +378,7 @@ class ExportFormat(Enum):
     NERF_SYNTH   = auto()
     TACV         = auto()          # Time-Archival Camera Virtualisation
     COLMAP_POSES = auto()      # ----- COLMAP (poses-only) ----
-    COLMAP_3DGS_MESH = auto()   # ← NEW: surface-sampling route
+    COLMAP_3DGS  = auto()   
 # ──────────────────────────────────────────────────────────── #
 #  New: abstract writer & concrete NGP / NeRF-Synthetic writer
 # ──────────────────────────────────────────────────────────── #
@@ -533,58 +772,171 @@ class ColmapPoseWriter(DatasetWriter):
             except subprocess.CalledProcessError as e:
                 print("[RS-Studio] ❌  colmap model_converter failed:", e,
                       file=sys.stderr)
-# ------------------------------------------------------------------ 3DGS Writer (Surface-sampling route C)
-class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
+
+# ------------------------------------------------------------------ 3DGS Writer (Depth-fusion route B)
+class Colmap3DGSDepthWriter(ColmapPoseWriter):
     """
     Export a COLMAP dataset ready for 3DGS by:
-    1) rendering per-view color PNGs (no depth rendering);
-    2) sampling points directly on mesh surfaces (uniform-by-area);
-    3) filtering by camera visibility ("what cameras would actually see"):
-         - view frustum test (fx, fy, cx, cy; near/far; image bounds)
-         - optional backface culling (normal faces camera)
-         - occlusion ray-cast against the evaluated scene
-       A point is kept if visible by >= min_visible_cameras;
-    4) optional voxel-grid merge (averaging color) to control count;
-    5) write fused_points.ply and sparse points3D.txt (OpenCV world).
-    Notes:
-    - This avoids per-view depth quirks and removes inside/occluded surfaces.
-    - For albedo: attempts UV → ImageTexture sampling; falls back to vertex
-      color (if present) or material base-color (constant) -> white.
-    - UDIM is treated tile-aware when Blender Image is TILED (best-effort).
-    """
+    1) rendering per-view color (PNG) and depth (EXR, Z pass);
+    2) back-projecting pixels to camera coordinates using (fx, fy, cx, cy);
+    3) converting to Blender-local (X, Y, Z_bl = Xc, -Yc, -Zc) and then to world;
+    4) voxel-grid fusion (averaging color), writing fused_points.ply;
+    5) writing sparse model (cameras.txt, images.txt, points3D.txt) and
+       converting to BIN via `colmap model_converter` when available.
 
+    Notes:
+    - v axis follows image row index (top->down). This matches cy we derive.
+    - depth is in metres (Blender units). Background yields 0 or very large Z,
+      we clip by [clip_start, clip_end].
+    - Tracks in points3D are emitted with length 0 (allowed by COLMAP parser).
+    """
     def __init__(self, root_out: Path, cam0):
         super().__init__(root_out, cam0)
+        self._depth_paths: dict[Path, Path] = {}  # color-abs-path -> depth-abs-path
+
         scn = bpy.context.scene
-        # we only need color PNGs for training
+        # ensure Z pass and compositor
+        for view_layer in scn.view_layers:
+            view_layer.use_pass_z = True
+        scn.render.use_compositing = True
+        scn.use_nodes = True
+
+        self._fo_node, self._fo_slot = self._ensure_depth_output_node(scn)
+
+        # render color as PNG (3DGS expects regular images)
         imgset = scn.render.image_settings
         imgset.file_format = 'PNG'
         imgset.color_mode = 'RGB'
         imgset.color_depth = '8'
 
-    # ---- main finish: write poses (txt), then sample surfaces & write ply / points3D
+        # tunables (read from scene.rs_settings if present)
+        rs = getattr(scn, "rs_settings", None)
+        self._stride = int(getattr(rs, "depth_stride", 4))             # sample every N pixels
+        self._voxel = float(getattr(rs, "pointcloud_voxel", 0.01))     # metres
+        self._max_points = int(getattr(rs, "pointcloud_max_points", 2_000_000))
+        # --- force Cycles for reliable Z pass ---
+        self._prev_engine = scn.render.engine
+        try:
+            engines = {e.identifier for e in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items}
+        except Exception:
+            engines = {"CYCLES", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"}
+        if "CYCLES" in engines:
+            scn.render.engine = "CYCLES"
+    # ---- compositor setup ---------------------------------------------------
+    @staticmethod
+    def _ensure_depth_output_node(scene: bpy.types.Scene):
+        """
+        Ensure a compositor pipeline that actually runs and writes Z as EXR.
+        """
+        nt = scene.node_tree
+
+        # Render Layers
+        rl = next((n for n in nt.nodes if n.type == 'R_LAYERS'), None)
+        if rl is None:
+            rl = nt.nodes.new("CompositorNodeRLayers")
+        rl.scene = scene
+        try:
+            rl.layer = scene.view_layers.active.name
+        except Exception:
+            pass
+
+        # Composite (ensure compositor runs)
+        comp = next((n for n in nt.nodes if n.type == 'COMPOSITE'), None)
+        if comp is None:
+            comp = nt.nodes.new("CompositorNodeComposite")
+        try:
+            nt.links.new(rl.outputs.get("Image"), comp.inputs.get("Image"))
+        except Exception:
+            pass
+
+        # File Output (EXR, 32-bit, single channel)
+        fo = next((n for n in nt.nodes if n.name == "RS_Depth_Output" and n.type == 'OUTPUT_FILE'), None)
+        if fo is None:
+            fo = nt.nodes.new("CompositorNodeOutputFile")
+            fo.name = "RS_Depth_Output"
+
+        if not fo.file_slots:
+            fo.file_slots.new("DepthZ")
+        slot = fo.file_slots[0]
+        slot.use_node_format = True  # <<< important: slot follows node format
+
+        fo.base_path = "//"
+        fo.format.file_format = 'OPEN_EXR'
+        fo.format.color_mode  = 'BW'
+        fo.format.color_depth = '32'
+
+        # Link Depth (some versions call it "Z")
+        depth_out = rl.outputs.get("Depth") or rl.outputs.get("Z")
+        if depth_out is not None:
+            # remove any prior link into fo.inputs[0]
+            for l in list(nt.links):
+                if l.to_node == fo and l.to_socket == fo.inputs[0]:
+                    nt.links.remove(l)
+            nt.links.new(depth_out, fo.inputs[0])
+
+        return fo, slot
+    def _resolve_depth_file(self, expected: Path) -> Path | None:
+        """Return the actual EXR file path. Blender's File Output often appends frame digits."""
+        if expected.exists():
+            return expected
+        cand = sorted(expected.parent.glob(expected.stem + "*.exr"))
+        return cand[-1] if cand else None
+    # ---- tell the compositor where to write the EXR for this render --------
+    def _prepare_depth_path_for_seq(self, frame: int, seq: int, out_dir: Path) -> Path:
+        depth_dir = out_dir / f"frame_{frame}" / "depth"
+        depth_dir.mkdir(parents=True, exist_ok=True)
+        # File Output node uses base_path + slot.path; no frame digits if we set exact name.
+        self._fo_node.base_path = os.fspath(depth_dir)
+        name = f"f{frame:04d}_c{seq:04d}"  # yields .../0000.exr
+        self._fo_slot.path = name
+        return depth_dir / f"{name}.exr"
+
+    # ---- override file path hook to also schedule depth writing -------------
+    def filepath_for(self, cam_obj, _global_idx):
+        frame = bpy.context.scene.frame_current
+        seq   = self._seq_per_frame.setdefault(frame, 0)
+
+        # color path (PNG), identical to ColmapPoseWriter
+        img_dir = self.root / f"frame_{frame}" / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        color_path = img_dir / f"{seq:04d}.png"
+
+        # schedule EXR depth output through compositor
+        depth_path = self._prepare_depth_path_for_seq(frame, seq, self.root)
+        # remember mapping (absolute paths)
+        self._depth_paths[color_path.resolve()] = depth_path
+
+        self._seq_per_frame[frame] = seq + 1
+        return color_path
+
+    # keep registration logic (camera + image path)
+    def register_frame(self, cam_obj, img_path: Path):
+        super().register_frame(cam_obj, img_path)
+
+    # ---- main finish: write poses (txt), fuse points, write ply & points3D --
     def finish(self):
-        # 1) write cameras.txt / images.txt / empty points3D.txt (poses-only)
+        # write cameras.txt / images.txt / empty points3D.txt first (poses-only)
         super().finish()
 
-        # 2) for each frame: build surface point cloud with visibility filter
+        # then per-frame: fuse depth → PLY, and write points3D.txt with 0-length tracks
         for frame, items in self._frames.items():
             frame_dir = self.root / f"frame_{frame}"
             sparse0   = frame_dir / "sparse" / "0"
             points_txt = sparse0 / "points3D.txt"
 
-            pts = self._sample_surface_points_for_frame(frame, items)
-            self._write_ply(frame_dir / "fused_points.ply", pts)
-
-            # 3) write points3D.txt (OpenCV world)
+            fused_pts_cv = self._fuse_points_for_frame(frame, items)   # OpenCV world
+            # 1) write PLY in OpenCV world (for Open3D viewer)
+            self._write_ply(frame_dir / "fused_points.ply", fused_pts_cv)
+            debug_report_depth_planes(self.root, frame, items, step=max(4, self._stride), write_ply=True)
+            # 2) write points3D.txt directly in OpenCV world
             with points_txt.open("w", encoding="utf8") as f:
-                f.write("# 3DGS initialization points generated from mesh surface sampling (OpenCV world)\n")
+                f.write("# 3DGS initialization points generated from depth fusion (OpenCV world)\n")
                 pid = 1
-                for (x, y, z, r, g, b) in pts:
+                for (x, y, z, r, g, b) in fused_pts_cv:
                     f.write(f"{pid} {x} {y} {z} {r} {g} {b} 0.0 0\n")
                     pid += 1
 
-            # optional BIN conversion if COLMAP exists
+            # optional: convert to BIN if COLMAP exists
             colmap_exe = shutil.which("colmap")
             if colmap_exe:
                 try:
@@ -597,358 +949,146 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
                     )
                 except subprocess.CalledProcessError as e:
                     print("[RS-Studio] ⚠ model_converter failed; keep .txt:", e.stderr)
-    def _write_ply(self, path: Path, pts: list[tuple[float,float,float,int,int,int]]) -> None:
-        """Write binary little-endian PLY with XYZ + RGB."""
-        import struct
-        path.parent.mkdir(parents=True, exist_ok=True)
-        header = (
-            "ply\n"
-            "format binary_little_endian 1.0\n"
-            f"element vertex {len(pts)}\n"
-            "property float x\n"
-            "property float y\n"
-            "property float z\n"
-            "property uchar red\n"
-            "property uchar green\n"
-            "property uchar blue\n"
-            "end_header\n"
-        ).encode("ascii")
-        with open(path, "wb") as f:
-            f.write(header)
-            pack = struct.Struct("<fffBBB").pack
-            for x, y, z, r, g, b in pts:
-                f.write(pack(float(x), float(y), float(z), int(r), int(g), int(b)))
-    # ---- core: surface sampling with visibility filtering ------------------
-    def _sample_surface_points_for_frame(self, frame: int, items: list[tuple[bpy.types.Object, Path]]):
+                    # restore previous engine
+        
+        try:
+            bpy.context.scene.render.engine = self._prev_engine
+        except Exception:
+            pass
+    def _blender_to_colmap(self, cam_obj):
+        import mathutils as mu
+        M_bl = cam_obj.matrix_world
+        A = mu.Matrix(((1,0,0,0),(0,0,1,0),(0,-1,0,0),(0,0,0,1)))
+        T = mu.Matrix(((1,0,0,0),(0,-1,0,0),(0,0,-1,0),(0,0,0,1)))
+        M_w2cv = T @ M_bl.inverted() @ A
+        R = M_w2cv.to_3x3()
+        t = M_w2cv.to_translation()      # NOTE: no global scaling here
+        q = R.to_quaternion()
+        return (q.w, q.x, q.y, q.z, t.x, t.y, t.z)
+    # ---- depth fusion core ---------------------------------------------------
+    def _fuse_points_for_frame(self, frame: int, items: list[tuple[bpy.types.Object, Path]]):
         """
-        Return list of (x, y, z, r, g, b) in OpenCV world.
-        Steps:
-          • gather triangles from visible MESH objects (evaluated depsgraph)
-          • sample ~target_count points (area-weighted)
-          • for each point, test visibility against multiple cameras
-          • optional voxel merge (color-averaging in world space)
+        Return a list of (x, y, z, r, g, b) in world coordinates.
+        Voxel-grid is used to merge duplicates and to tame point count.
         """
-        # OpenCV-world -> Blender-world (A_bl_from_cv)
-        A_bl_from_cv = mu.Matrix((
-            (1, 0,  0, 0),
-            (0, 0,  1, 0),
-            (0,-1,  0, 0),
-            (0, 0,  0, 1),
-        ))
-        # Blender-world -> OpenCV-world
-        A_cv_from_bl = A_bl_from_cv.inverted()
         scn = bpy.context.scene
-        rs  = getattr(scn, "rs_settings", None)
+        vox = max(self._voxel, 1e-6)
+        stride = max(self._stride, 1)
+        max_pts = max(self._max_points, 1)
 
-        # parameters (read from UI; provide robust defaults)
-        target_count     = int(getattr(rs, "mesh_points_target", 800_000))
-        voxel            = float(getattr(rs, "mesh_voxel", 0.01))
-        min_vis_cams     = int(getattr(rs, "mesh_min_visible_cameras", 1))
-        backface_cull    = bool(getattr(rs, "mesh_backface_cull", True))
-        max_cams_check   = int(getattr(rs, "mesh_max_cameras_check", 12))
-        vis_filter       = bool(getattr(rs, "mesh_visibility_filter", True))
-        color_mode       = str(getattr(rs, "mesh_color_mode", "TEXTURE"))  # TEXTURE / VCOL / MATERIAL / WHITE
-
-        # intrinsics cache per cam
-        w_render = int(scn.render.resolution_x * scn.render.resolution_percentage / 100)
-        h_render = int(scn.render.resolution_y * scn.render.resolution_percentage / 100)
-
-        cam_infos = []
-        for cam_obj, _ in items[:max_cams_check]:
-            w,h,fx,fy,cx,cy,_ = _intrinsics_from_cam(cam_obj.data, scn)
-            if (w != w_render) or (h != h_render):
-                # strictly adapt intrinsics to image size actually saved
-                sx, sy = (w_render / w), (h_render / h)
-                fx, fy = fx*sx, fy*sy
-                cx, cy = cx*sx, cy*sy
-                w, h = w_render, h_render
-            R_wc, C_w = extrinsics_cv_from_matrix_world(cam_obj.matrix_world)
-            cam_infos.append({
-                "obj": cam_obj, "R_wc": R_wc, "C_w": C_w,
-                "fx": fx, "fy": fy, "cx": cx, "cy": cy,
-                "w": w_render, "h": h_render,
-                "near": float(cam_obj.data.clip_start),
-                "far":  float(cam_obj.data.clip_end),
-            })
-
-        # depsgraph & evaluated scene for accurate geometry + ray cast
-        dg = bpy.context.evaluated_depsgraph_get()
-
-        # 1) collect triangles (world space) + UV/material hooks  [Blender 4.4 safe]
-        tris: list[dict] = []    # each: {p0,p1,p2,n0,n1,n2,area,uv0,uv1,uv2,img,base_rgba}
-        tot_area = 0.0
-        _img_cache: dict = {}    # Image -> (np_pixels, w, h, ch, is_udim, tiles_dict)
-        _mat_img_cache: dict = {}  # Material -> preferred Image or None
-
-        def _find_image_from_material(mat: bpy.types.Material):
-            """Return an Image used as albedo source if possible (first try BaseColor)."""
-            if mat is None or not mat.use_nodes or mat.node_tree is None:
-                return None
-            nt = mat.node_tree
-            # Prefer the ImageTexture feeding Principled BSDF Base Color
-            bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-            if bsdf and "Base Color" in bsdf.inputs:
-                for lk in bsdf.inputs["Base Color"].links:
-                    if lk.from_node.type == 'TEX_IMAGE' and lk.from_node.image is not None:
-                        return lk.from_node.image
-            # Fallback: first TEX_IMAGE
-            for n in nt.nodes:
-                if n.type == 'TEX_IMAGE' and n.image is not None:
-                    return n.image
-            return None
-
-        def _ensure_image_cached(img: bpy.types.Image):
-            """Return (pix_np, w, h, ch, is_tiled_udim, tiles_dict). Robust to empty images."""
-            if img in _img_cache:
-                return _img_cache[img]
-            ch = int(getattr(img, "channels", 4) or 4)
-            is_tiled = (getattr(img, "source", "") == 'TILED')
-            if is_tiled:
-                # Build per-tile cache: {tile_number -> (np_pixels, w, h, ch)}
-                tiles = {}
-                for t in getattr(img, "tiles", []):
-                    try:
-                        img.tile_number = t.number
-                        w = int(img.size[0]); h = int(img.size[1])
-                        if w < 1 or h < 1:
-                            continue
-                        arr = np.array(img.pixels[:], dtype=np.float32)
-                        if arr.size < w * h * ch:
-                            continue
-                        tiles[t.number] = (arr, w, h, ch)
-                    except Exception:
-                        continue
-                _img_cache[img] = (None, 0, 0, ch, True, tiles)
-            else:
-                w = int(img.size[0]); h = int(img.size[1])
-                if w < 1 or h < 1:
-                    _img_cache[img] = (np.empty(0, dtype=np.float32), 0, 0, ch, False, None)
-                else:
-                    arr = np.array(img.pixels[:], dtype=np.float32)
-                    _img_cache[img] = (arr, w, h, ch, False, None)
-            return _img_cache[img]
-
-        def _sample_image_rgba(img: bpy.types.Image, uv: Vector):
-            """Return (r,g,b,a) in 0..255 from Image/UDIM; fall back to white on any issue."""
-            if img is None:
-                return (255, 255, 255, 255)
-            pix, w, h, ch, is_udim, tiles = _ensure_image_cached(img)
-            u, v = float(uv.x), float(uv.y)
-            if is_udim:
-                ut = int(math.floor(u)); vt = int(math.floor(v))
-                lu = u - ut; lv = v - vt
-                tile_no = 1001 + ut + 10 * vt
-                if not tiles or tile_no not in tiles:
-                    return (255, 255, 255, 255)
-                arr, tw, th, tch = tiles[tile_no]
-                if tw < 1 or th < 1 or arr.size < tw * th * tch:
-                    return (255, 255, 255, 255)
-                x = min(tw - 1, max(0, int(lu * (tw - 1))))
-                y = min(th - 1, max(0, int(lv * (th - 1))))
-                idx = (y * tw + x) * tch
-                r = int(round(255.0 * arr[idx + 0])) if tch >= 1 else 255
-                g = int(round(255.0 * arr[idx + 1])) if tch >= 2 else 255
-                b = int(round(255.0 * arr[idx + 2])) if tch >= 3 else 255
-                a = int(round(255.0 * arr[idx + 3])) if tch >= 4 else 255
-                return (r, g, b, a)
-            else:
-                if w < 1 or h < 1 or pix.size < w * h * ch:
-                    return (255, 255, 255, 255)
-                x = min(w - 1, max(0, int(u * (w - 1))))
-                y = min(h - 1, max(0, int(v * (h - 1))))
-                idx = (y * w + x) * ch
-                r = int(round(255.0 * pix[idx + 0])) if ch >= 1 else 255
-                g = int(round(255.0 * pix[idx + 1])) if ch >= 2 else 255
-                b = int(round(255.0 * pix[idx + 2])) if ch >= 3 else 255
-                a = int(round(255.0 * pix[idx + 3])) if ch >= 4 else 255
-                return (r, g, b, a)
-
-        # Traverse *evaluated instances* so collection/geometry instances are included.
-        for inst in dg.object_instances:
-            obj_eval = inst.object.evaluated_get(dg)
-            if obj_eval.type != 'MESH' or obj_eval.hide_render:
+        accum: dict[tuple[int, int, int], list[float]] = {}
+        counts: dict[tuple[int, int, int], int] = {}
+        import mathutils as mu
+        for cam_obj, img_abs in items:
+            color_abs = (self.root / img_abs).resolve()
+            # --- map color → expected depth, then resolve actual filename ---
+            depth_expected = self._depth_paths.get(color_abs) or self._depth_paths.get((self.root / img_abs))
+            if depth_expected is None:
+                continue
+            depth_abs = self._resolve_depth_file(depth_expected)
+            if depth_abs is None:
+                print(f"[RS-Studio] Depth EXR not found for {color_abs.name} – looked for {depth_expected}")
                 continue
 
-            me = obj_eval.to_mesh()
-            if me is None:
-                continue
-            mw = inst.matrix_world
-
+            # load color & depth images
+            col_img = bpy.data.images.load(os.fspath(color_abs), check_existing=True)
+            dep_img = bpy.data.images.load(os.fspath(depth_abs), check_existing=True)
+            # avoid any display transform while we read raw pixels
             try:
-                # We only need loop triangles in 4.4; do NOT call calc_normals* (removed).
-                if hasattr(me, "calc_loop_triangles"):
-                    me.calc_loop_triangles()
+                dep_img.use_view_as_render = False
+                dep_img.colorspace_settings.name = "Non-Color"
+            except Exception:
+                pass
+            w, h = col_img.size[0], col_img.size[1]
+            # intrinsics for this camera
+            w0,h0,fx,fy,cx,cy,_ = _intrinsics_from_cam(cam_obj.data, scn)
+            # guard (should match render size)
+            if int(w0) != int(w) or int(h0) != int(h):
+                fx *= (w / w0);  fy *= (h / h0)
+                cx *= (w / w0);  cy *= (h / h0)
 
-                uv_layer = me.uv_layers.active
-                has_uv = uv_layer is not None
-                mats = obj_eval.material_slots
+            # near/far to filter invalid depths
+            z_near = float(cam_obj.data.clip_start)
+            z_far  = float(cam_obj.data.clip_end)
 
-                for lt in me.loop_triangles:
-                    vid = lt.vertices
-                    li  = lt.loops
-
-                    # World-space triangle vertices
-                    p0 = (mw @ me.vertices[vid[0]].co).to_3d()
-                    p1 = (mw @ me.vertices[vid[1]].co).to_3d()
-                    p2 = (mw @ me.vertices[vid[2]].co).to_3d()
-
-                    # Flat normal and area
-                    e1 = p1 - p0
-                    e2 = p2 - p0
-                    n_flat = e1.cross(e2)
-                    area = float(n_flat.length * 0.5)
-                    if area <= 0.0:
+            col_px = col_img.pixels[:]   # RGBA ... length = w*h*4
+            dep_px = dep_img.pixels[:]
+            col_ch = int(getattr(col_img, "channels", 4) or 4)  # usually 4 for PNG
+            dep_ch = int(getattr(dep_img, "channels", 1) or 1)  # EXR depth is often 1
+            R_wc_mu, C_w_mu = extrinsics_cv_from_matrix_world(cam_obj.matrix_world)
+            taken = 0
+            for v in range(0, h, stride):
+                for u in range(0, w, stride):
+                    # --- read & geometry must refer to the *same* pixel center ---
+                    # Blender stores pixels bottom→top; our geometry uses top→down.
+                    # So convert once, then use that single (u_c, v_c) everywhere.
+                    v_img = (h - 1 - v)
+                    base  = v_img * w + u
+                    off_c = base * col_ch
+                    off_d = base * dep_ch
+                    Z = float(dep_px[off_d])  # first channel only
+                    if not (z_near < Z < z_far) or not math.isfinite(Z) or Z <= 0.0:
                         continue
-                    n_flat.normalize()
+                    # pixel centers in their respective conventions
+                    u_c = u + 0.5                              # x: left→right
+                    v_td = v + 0.5                             # y:  top→down  (for cx,cy)
+                    # now back-project using the *same* sample (u_c, v_td)
+                    sx = (u_c - cx) / fx
+                    sy = (v_td - cy) / fy
+                    # Depth pass here is *projection depth* Zc (confirmed)
 
-                    # Per-corner normals = flat normal (sufficient for culling/shading)
-                    n0 = n1 = n2 = n_flat
+                    Xc = sx * Z
+                    Yc = sy * Z
+                    Zc = Z
+                    # Blender local then world
+                    P_w = (R_wc_mu @ mu.Vector((Xc, Yc, Zc))) + C_w_mu
+                    xw, yw, zw = P_w.x, P_w.y, P_w.z
+                    # color in 0..255
+                    r = int(max(0, min(255, round(col_px[off_c + 0] * 255.0))))
+                    g = int(max(0, min(255, round(col_px[off_c + 1] * 255.0))))
+                    b = int(max(0, min(255, round(col_px[off_c + 2] * 255.0))))
 
-                    # UVs
-                    if has_uv:
-                        uv0 = uv_layer.data[li[0]].uv.copy()
-                        uv1 = uv_layer.data[li[1]].uv.copy()
-                        uv2 = uv_layer.data[li[2]].uv.copy()
+                    key = (int(round(xw / vox)), int(round(yw / vox)), int(round(zw / vox)))
+                    if key not in accum:
+                        accum[key]  = [xw, yw, zw, float(r), float(g), float(b)]
+                        counts[key] = 1
                     else:
-                        uv0 = uv1 = uv2 = Vector((0.5, 0.5))
+                        acc = accum[key]
+                        acc[0] += xw; acc[1] += yw; acc[2] += zw
+                        acc[3] += r;  acc[4] += g;  acc[5] += b
+                        counts[key] += 1
 
-                    # Optional texture image per material (cached)
-                    img = None
-                    if color_mode == "TEXTURE" and len(mats) and lt.polygon_index < len(me.polygons):
-                        midx = me.polygons[lt.polygon_index].material_index
-                        mat = mats[midx].material if midx < len(mats) else None
-                        if mat not in _mat_img_cache:
-                            _mat_img_cache[mat] = _find_image_from_material(mat)
-                        img = _mat_img_cache[mat]
+                    taken += 1
+                    if len(accum) >= max_pts:
+                        break
+                if len(accum) >= max_pts:
+                    break
 
-                    tris.append(dict(
-                        p0=p0, p1=p1, p2=p2,
-                        n0=n0, n1=n1, n2=n2,
-                        uv0=uv0, uv1=uv1, uv2=uv2,
-                        img=img, base_rgba=(255, 255, 255, 255),
-                        area=area
-                    ))
-                    tot_area += area
-            finally:
-                # Always free the evaluated mesh to avoid leaks
-                obj_eval.to_mesh_clear()
+            # clean up RAM
+            bpy.data.images.remove(col_img)
+            bpy.data.images.remove(dep_img)
 
-        if tot_area <= 0.0 or not tris:
-            print("[RS-Studio] No triangles found (hidden-from-render? or all instances culled?).")
-            return []
-
-        # 2) stochastic sampling per area
-        rng = np.random.default_rng(12345)
-        # cumulative distribution
-        areas = np.fromiter((t["area"] for t in tris), dtype=np.float64, count=len(tris))
-        cdf = np.cumsum(areas); cdf /= cdf[-1]
-
-        # helper projection/visibility
-        def _project_and_visible(Pw_bl: mu.Vector, Nw_bl: mu.Vector) -> bool:
-            """Return True if the Blender-world point is seen by >= min_vis_cams."""
-            if not vis_filter:
-                return True
-            vis_cnt = 0
-            # Convert point to OpenCV world for projection
-            Pw_cv = A_cv_from_bl.to_3x3() @ Pw_bl
-
-            for ci in cam_infos:
-                # backface culling in Blender world (camera pos converted to Blender)
-                Cw_bl = A_bl_from_cv.to_3x3() @ mu.Vector(ci["C_w"])
-                if backface_cull and (Nw_bl.dot(Cw_bl - Pw_bl) <= 0.0):
-                    continue
-
-                # project in OpenCV camera coords
-                Xc = (ci["R_wc"].transposed() @ (mu.Vector((Pw_cv.x, Pw_cv.y, Pw_cv.z)) - mu.Vector(ci["C_w"])))
-                Zc = float(Xc.z)
-                if not (ci["near"] < Zc < ci["far"]):
-                    continue
-                u = ci["fx"] * (Xc.x / Zc) + ci["cx"]
-                v = ci["fy"] * (Xc.y / Zc) + ci["cy"]
-                if not (0.0 <= u < ci["w"] and 0.0 <= v < ci["h"]):
-                    continue
-
-                # occlusion test must be in Blender world
-                origin = Cw_bl
-                dirv   = Pw_bl - origin
-                dist   = max(1e-6, dirv.length)
-                hit, *_ = bpy.context.scene.ray_cast(
-                    dg, origin, dirv.normalized(), distance=dist - 1e-5
-                )
-                if hit:
-                    continue  # blocked
-
-                vis_cnt += 1
-                if vis_cnt >= min_vis_cams:
-                    return True
-            return False
-
-
-        # voxel merge accumulators
-        vox = max(voxel, 1e-6)
-        accum: dict[tuple[int,int,int], list[float]] = {}
-        counts: dict[tuple[int,int,int], int] = {}
-
-        # sample loop
-        for _ in range(target_count * 3):  # oversample; visibility + voxel will thin it
-            r = rng.random()
-            idx = int(np.searchsorted(cdf, r, side="right"))
-            if idx >= len(tris):
-                idx = len(tris)-1
-            t = tris[idx]
-            # barycentric (u,v,w) with sqrt rand for uniform area sampling
-            r1 = rng.random(); r2 = rng.random()
-            su = math.sqrt(r1)
-            b0 = 1.0 - su
-            b1 = su * (1.0 - r2)
-            b2 = su * r2
-            # interpolate position / normal / uv
-            Pw = (t["p0"] * b0 + t["p1"] * b1 + t["p2"] * b2)
-            Nw = (t["n0"] * b0 + t["n1"] * b1 + t["n2"] * b2).normalized()
-            uv = (t["uv0"] * b0 + t["uv1"] * b1 + t["uv2"] * b2)
-
-            if not _project_and_visible(Pw, Nw):
-                continue
-
-            # color
-            if color_mode == "TEXTURE" and (t["img"] is not None):
-                r,g,b,a = _sample_image_rgba(t["img"], uv)
-            elif color_mode == "VCOL":
-                r,g,b,a = (220,220,220,255)  # TODO: vertex-color path (optional)
-            elif color_mode == "MATERIAL":
-                r,g,b,a = (200,200,200,255)
-            else:
-                r,g,b,a = (255,255,255,255)
-
-            # voxel key
-            k = (int(round(Pw.x/vox)), int(round(Pw.y/vox)), int(round(Pw.z/vox)))
-            if k not in accum:
-                accum[k]  = [Pw.x, Pw.y, Pw.z, float(r), float(g), float(b)]
-                counts[k] = 1
-            else:
-                acc = accum[k]; c = counts[k]
-                acc[0] += Pw.x; acc[1] += Pw.y; acc[2] += Pw.z
-                acc[3] += r;    acc[4] += g;    acc[5] += b
-                counts[k] = c + 1
-
-            if len(accum) >= target_count:
-                break
-
-        # average within voxels; also convert to OpenCV world (already is)
-        out: list[tuple[float,float,float,int,int,int]] = []
+        # average within voxels
+        out: list[tuple[float, float, float, int, int, int]] = []
         for k, acc in accum.items():
             c = counts[k]
-            x_bl = acc[0] / c; y_bl = acc[1] / c; z_bl = acc[2] / c
-            P_bl = mu.Vector((x_bl, y_bl, z_bl))
-            P_cv = A_cv_from_bl.to_3x3() @ P_bl
-            r = int(round(acc[3] / c))
-            g = int(round(acc[4] / c))
-            b = int(round(acc[5] / c))
-            out.append((float(P_cv.x), float(P_cv.y), float(P_cv.z), r, g, b))
-        print(f"[RS-Studio] frame {frame}: tris={len(tris)} tot_area={tot_area:.3f} "f"target={target_count} vox={voxel} fused_voxels={len(accum)} out_points={len(out)}")
+            x = acc[0] / c; y = acc[1] / c; z = acc[2] / c
+            r = int(round(acc[3] / c)); g = int(round(acc[4] / c)); b = int(round(acc[5] / c))
+            out.append((x, y, z, r, g, b))
         return out
 
-
+    # ---- write ASCII PLY ----------------------------------------------------
+    @staticmethod
+    def _write_ply(path: Path, pts: list[tuple[float, float, float, int, int, int]]):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="ascii") as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {len(pts)}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            for x,y,z,r,g,b in pts:
+                f.write(f"{x} {y} {z} {r} {g} {b}\n")
 # --------------------------------------------------------------------------- #
 # Sampling
 # --------------------------------------------------------------------------- #
@@ -1068,76 +1208,67 @@ class DatasetGenerator:
         self.end     = int(end_frame)
         self.export_fmt = export_fmt
         frame_cnt = self.end - self.start + 1
-        if export_fmt is ExportFormat.COLMAP_3DGS_MESH and self._colmap_ok:
+        if export_fmt is ExportFormat.COLMAP_3DGS and self._colmap_ok:
             per_frame_extra = 3
         else:
             per_frame_extra = 0
         self.total_images = len(self.cameras) * frame_cnt + per_frame_extra
-                
-    # core.py  — inside class DatasetGenerator
+        
     def iter_generate(self, output_dir: str | Path):
         from bpy.types import RenderSettings
+
         scene = bpy.context.scene
         prev_engine = scene.render.engine
+
+        # 枚举所有可用引擎，优先选 EEVEE Next，否则退回 Cycles
         engines = {e.identifier for e in RenderSettings.bl_rna.properties["engine"].enum_items}
         preferred = "BLENDER_EEVEE_NEXT" if "BLENDER_EEVEE_NEXT" in engines else "CYCLES"
-        if scene.render.engine == "BLENDER_WORKBENCH":
-            scene.render.engine = preferred
 
-        writer = None  # ← ensure we can call finish() even if something fails early
-        try:
+        if scene.render.engine == "BLENDER_WORKBENCH":
+            scene.render.engine = preferred        # 切换到能渲染贴图的引擎
+        try:  
             root_out = Path(bpath.abspath(str(output_dir))).resolve()
             root_out.mkdir(parents=True, exist_ok=True)
 
             cam0 = self.cameras[0].data
-            # --- choose writer ---
-            if self.export_fmt is ExportFormat.COLMAP_POSES:
+            frame_cnt = self.end - self.start + 1
+
+            # ---------- 创建 writer 实例 ----------
+            if self.export_fmt is ExportFormat.COLMAP_3DGS:
+                # New route B: depth-fusion writer
+                writer = Colmap3DGSDepthWriter(root_out, cam0)
+            elif self.export_fmt is ExportFormat.COLMAP_POSES:
                 writer = ColmapPoseWriter(root_out, cam0)
             elif self.export_fmt is ExportFormat.NERF_SYNTH:
                 writer = NeRFSyntheticWriter(root_out, cam0)
             elif self.export_fmt is ExportFormat.TACV:
                 writer = TACVDatasetWriter(root_out, cam0)
-            elif self.export_fmt is ExportFormat.COLMAP_3DGS_MESH:
-                writer = Colmap3DGSSurfaceWriter(root_out, cam0)
-            else:
+            else:                                        # 默认 Instant-NGP
                 writer = NGPDatasetWriter(root_out, cam0)
 
-            self._writer_inst = writer
+            self._writer_inst = writer                   # 供后处理阶段使用
 
-            # --- render loop ---
+            # ---------- 渲染循环 ----------
             done = 0
             for frame_idx in range(self.start, self.end + 1):
-                scene.frame_set(frame_idx)
+                bpy.context.scene.frame_set(frame_idx)
                 for cam in self.cameras:
                     path = writer.filepath_for(cam, done)
-                    scene.camera = cam
-                    scene.render.filepath = str(path)
+                    bpy.context.scene.camera = cam
+                    bpy.context.scene.render.filepath = str(path)
                     bpy.ops.render.render(write_still=True, use_viewport=False)
 
-                    # register relative path
                     rel = path.relative_to(root_out).as_posix()
                     writer.register_frame(cam, rel)
 
                     done += 1
                     yield done, self.total_images
 
-            # --- optional postprocess ---
+            # ---------- 后处理 ----------
             for _ in writer.postprocess_iter():
                 done += 1
                 yield done, self.total_images
 
-            # normal finish
             writer.finish()
-
-        except Exception as e:
-            print("[RS-Studio] Generation aborted:", e)
-            import traceback; traceback.print_exc()
-            # still try to salvage poses/points/ply
-            try:
-                if writer is not None:
-                    writer.finish()
-            except Exception as e2:
-                print("[RS-Studio] finish() also failed:", e2)
-
         finally:
-            scene.render.engine = prev_engine
+            scene.render.engine = prev_engine      # 恢复用户原设置

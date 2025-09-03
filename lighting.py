@@ -21,6 +21,26 @@ from typing import Iterable
 import datetime as _dt
 import math
 from mathutils import Vector
+import bmesh
+import random
+
+# ===== 1. 顶部区域：常量 & collection helper =============================
+_LIGHTS_COLLECTION = "RS_Lighting"          # <- NEW
+
+def _ensure_lights_collection() -> bpy.types.Collection:
+    """Return the dedicated collection that stores every light created by RS-Studio."""
+    return _ensure_collection(_LIGHTS_COLLECTION)
+def _clear_lights_collection() -> None:
+    """
+    Remove every object inside RS_Lighting collection
+    (called each time before new lights are built).
+    """
+    col = bpy.data.collections.get(_LIGHTS_COLLECTION)
+    if not col:
+        return
+    for obj in list(col.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+
 try:
     from pysolar.solar import get_altitude, get_azimuth
     _HAS_PYSOLAR = True
@@ -72,20 +92,47 @@ class RSLightingSettings(bpy.types.PropertyGroup):
                ("OUTDOOR", "Outdoor (sun & sky)", "")],
         default="OUTDOOR",
     )  # type: ignore
-
+    # ───────── Indoor controls ─────────
+    indoor_key_strength: FloatProperty(      # type: ignore  # 主灯（Key）
+        name="Key",
+        min=0.0, max=2.0, default=1.0,
+        description="Key-light multiplier"
+    )
+    indoor_fill_strength: FloatProperty(     # type: ignore  # 补光（Fill）
+        name="Fill",
+        min=0.0, max=1.0, default=0.4,
+        description="Fill-light multiplier"
+    )
+    indoor_rim_strength: FloatProperty(     # type: ignore   # 边缘光 / 背光（Rim）
+        name="Rim",
+        min=0.0, max=1.5, default=0.6,
+        description="Rim-light multiplier"
+    )
     # 2) Weather
     weather: EnumProperty(
         name="Weather",
-        items=[("CLEAR", "Clear", ""),
-               ("OVERCAST", "Overcast", ""),
-               ("RAIN", "Rain", ""),
-               ("FOG", "Fog / Haze", "")],
-        default="CLEAR",
+        items=[                                   # ⇐ 只剩 3 个选项
+            ("SUNNY", "Sunny (Clear Sky)",  ""),
+            ("RAIN",  "Rain",                ""),
+            ("FOG",   "Fog / Haze",          ""),
+        ],
+        default="SUNNY",
     )  # type: ignore
-
-    cloudiness:     FloatProperty(name="Cloud cover", min=0.0, max=1.0, default=0.2)  # type: ignore
+    sun_intensity: FloatProperty(                              # type: ignore
+        name="Sun Intensity",
+        min=0.0, max=2.0, default=1.0,
+        description="Multiply physical sunlight brightness",
+    )
+    cloudiness: FloatProperty(options={"HIDDEN"})              # type: ignore
     rain_intensity: FloatProperty(name="Rain",        min=0.0, max=1.0, default=0.4)  # type: ignore
-    fog_density:    FloatProperty(name="Fog density", min=0.0, max=0.1, default=0.02) # type: ignore
+    # visibility (meteorological range, metres)
+    fog_visibility: FloatProperty(
+        name="Visibility (m)",
+        min=10.0, max=5_000.0, default=500.0,
+        description="Human-eye visual range; density is solved from it",
+    )  # type: ignore
+    # keep the old field as a hidden legacy fallback
+    fog_density: FloatProperty(options={"HIDDEN"}) # type: ignore
 
     # 3) Explicit Date · Time · Lat · Lon  (sun angles -- TODO)
     date:      StringProperty(name="Date (YYYY-MM-DD)", default="2025-06-15")             # type: ignore
@@ -104,17 +151,26 @@ class RSLightingSettings(bpy.types.PropertyGroup):
 # ---- object management --------------------------------------------------- #
 def _ensure_light(name: str, kind: str) -> bpy.types.Object:
     """
-    Get existing light object *name*, or create a new one of *kind*
-    ('SUN' | 'AREA' | 'POINT' …).  Returned object is always linked to
-    scene.collection (top-level) so user can move it at will.
+    Get (or create) a Light named *name* of Blender type *kind* and make sure
+    it lives in the dedicated RS_Lighting collection (only once).
     """
     obj = bpy.data.objects.get(name)
-    if obj and obj.type == 'LIGHT':
-        return obj
 
-    lite_data = bpy.data.lights.new(name, type=kind)
-    obj = bpy.data.objects.new(name, lite_data)
-    bpy.context.scene.collection.objects.link(obj)
+    if obj is None or obj.type != 'LIGHT':
+        # -------- create fresh light --------
+        data = bpy.data.lights.new(name, type=kind)
+        obj  = bpy.data.objects.new(name, data)
+
+    # -------- guarantee membership --------
+    col = _ensure_lights_collection()
+    if col not in obj.users_collection:
+        col.objects.link(obj)
+
+    # unlink † this light from any other collection to avoid duplicates
+    for c in list(obj.users_collection):
+        if c != col:
+            c.objects.unlink(obj)
+
     return obj
 
 
@@ -207,35 +263,46 @@ def _calc_sun_direction(date_str: str, hour_f: float,
     z = math.sin(alt)
     return Vector((x, y, z)).normalized(), alt
 
-
+# === Collection helper =====================================================
+def _ensure_collection(name: str) -> bpy.types.Collection:
+    col = bpy.data.collections.get(name)
+    if col is None:
+        col = bpy.data.collections.new(name)
+        bpy.context.scene.collection.children.link(col)
+    return col
 # -------------------------- update _setup_sun ------------------------------
+# ────────── ② _setup_sun：完全根据 sun_intensity 调节亮度 ──────────
 def _setup_sun(scene: bpy.types.Scene, cfg: RSLightingSettings):
     sun = _ensure_light("RS_Sun", "SUN")
+    dir_vec, alt = _calc_sun_direction(
+        cfg.date, cfg.hour, cfg.latitude, cfg.longitude
+    )
 
-    res = _calc_sun_direction(cfg.date, cfg.hour,
-                              cfg.latitude, cfg.longitude)
-    dir_vec, alt = res if isinstance(res, tuple) else (None, None)
-
-    # ---- 夜晚 ----------------------------------------------------------
-    if dir_vec is None:
-        sun.hide_render   = True
-        sun.hide_viewport = True
-        sun.data.energy   = 0.0
+    if dir_vec is None:                       # 夜晚
+        sun.hide_render = sun.hide_viewport = True
+        sun.data.energy = 0.0
         return
 
-    sun.hide_render   = False
-    sun.hide_viewport = False
+    sun.hide_render = sun.hide_viewport = False
 
-    # energy curve：正午 ≈ 5 kLux，低空渐暗
-    sun.data.energy = 5000 * max(0.0, math.sin(alt))
-    sun.data.angle  = math.radians(0.53)   # solar disc 半角≈0.25°, 取直径 0.53°
+    base_energy = 100 * max(0.0, math.sin(alt))   # ≈ 5 klx @ zenith
 
-    # 让 -Z 指向场景中心
+    # γ-curve: perceptually more linear (γ = 2.0)
+    gamma       = 1.0
+    scale       = cfg.sun_intensity ** gamma
+    sun.data.energy = base_energy * scale
+
+    if cfg.weather == "RAIN":                        # 雨天再做全局衰减
+        sun.data.energy *= (1.0 - 0.8 * cfg.rain_intensity)
+
+    sun.data.angle = math.radians(0.53)
     sun.rotation_euler = (-dir_vec).to_track_quat('-Z', 'Y').to_euler()
-    sun.location       = dir_vec * 10.0          # 保持远离原点即可
-    # 清除室内灯
+    sun.location = dir_vec * 10.0
+
     _remove_light("RS_In_AreaCeiling")
     _remove_light("RS_In_PointFill")
+
+
 # ---------------------------------------------------------------- SET-UPS --
 def _setup_sky(scene: bpy.types.Scene, cloudiness: float) -> None:
     """
@@ -250,8 +317,10 @@ def _setup_sky(scene: bpy.types.Scene, cloudiness: float) -> None:
     sky.turbidity = 2.0 + cloudiness * 8.0
 
     bg   = nt.nodes.new("ShaderNodeBackground")
-    out  = nt.nodes.new("ShaderNodeOutputWorld")
+    # heavy cloud → darker sky
+    bg.inputs["Strength"].default_value = 1.0 - 0.5 * (cloudiness ** 1.5)
 
+    out  = nt.nodes.new("ShaderNodeOutputWorld")
     nt.links.new(sky.outputs["Color"], bg.inputs["Color"])
     nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
 
@@ -265,58 +334,342 @@ def _clear_sky(scene: bpy.types.Scene) -> None:
     bg.inputs["Color"].default_value = (0.05, 0.05, 0.05, 1.0)
     out = nt.nodes.new("ShaderNodeOutputWorld")
     nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
-
-def _setup_indoor(scene: bpy.types.Scene) -> None:
+# ──────────────────────────────────────────────────────────────
+def _aim_at(obj: bpy.types.Object, target: Vector) -> None:
     """
-    Basic two-light indoor rig:
-        * RS_In_AreaCeiling – big soft box overhead
-        * RS_In_PointFill   – small omni fill light
+    Rotate *obj* so its −Z 轴（Blender 灯光默认前向）指向 *target*。
     """
-    # remove sun / sky first
-    _remove_light("RS_Sun")
+    direction = target - obj.location
+    if direction.length_squared == 0:
+        return                                              # already at target
+    obj.rotation_euler = direction.to_track_quat('-Z', 'Y').to_euler()
+# ──────────────────────────────────────────────────────────────
+def _setup_indoor(scene: bpy.types.Scene, cfg: RSLightingSettings):
+    """
+    Studio-like 3-point rig  （Key / Fill / Rim）＋ 低强度环境光
+    ───────────────────────────────────────────────────────────
+        RS_In_Key      : AREA，主光，从左前上方 45° 打向主体
+        RS_In_Fill     : AREA，补光，右侧，亮度较低、偏冷
+        RS_In_Rim      : SPOT，轮廓光，背后高处，制造边缘高光
+    用户可用三个 slider 调节各自能量倍率。
+    """
+    # 1) 彻底清除户外灯具与天空
+    for n in ("RS_Sun", "RS_In_AreaCeiling", "RS_In_PointFill"):
+        _remove_light(n)
     _clear_sky(scene)
+    _clear_rain(scene)
+    _clear_fog(scene)
+    target = Vector((0.0, 0.0, 0.0))
+    # 2) 柔和灰背景（营造室内环境光）
+    world = _ensure_world(scene)
+    _clear_world_nodes(world)
+    nt = world.node_tree
+    bg = nt.nodes.new("ShaderNodeBackground")
+    bg.inputs["Color"].default_value = (0.04, 0.04, 0.04, 1.0)
+    bg.inputs["Strength"].default_value = 0.8     # 环境强度
+    out = nt.nodes.new("ShaderNodeOutputWorld")
+    nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
 
-    # Area light – ceiling panel
-    area = _ensure_light("RS_In_AreaCeiling", "AREA")
-    area.location = (0.0, 0.0, 5.0)
-    area.rotation_euler = (radians(180.0), 0.0, 0.0)   # face downward
-    area.data.shape = 'RECTANGLE'
-    area.data.size = 6.0
-    area.data.size_y = 4.0
-    area.data.energy = 800.0
+    # ───────── Key (主光) ─────────
+    key = _ensure_light("RS_In_Key", "AREA")
+    key.data.shape = 'RECTANGLE'
+    key.data.size  = 2.5
+    key.data.size_y = 3.5
+    key.location = (-4.0, -3.0, 3.0)
+    _aim_at(key, target)  
+    key.data.color = (1.0, 0.92, 0.88)           # 略暖
+    key.data.energy = 600.0 * cfg.indoor_key_strength
 
-    # Point light – gentle fill
-    pt = _ensure_light("RS_In_PointFill", "POINT")
-    pt.location = (0.0, 0.0, 2.0)
-    pt.data.energy = 300.0
+    # ───────── Fill (补光) ─────────
+    fill = _ensure_light("RS_In_Fill", "AREA")
+    fill.data.shape = 'RECTANGLE'
+    fill.data.size = 2.0
+    fill.data.size_y = 2.0
+    fill.location = (3.0, -2.5, 2.2)
+    _aim_at(fill, target)  
+    fill.data.color = (0.85, 0.90, 1.0)          # 略冷
+    fill.data.energy = 300.0 * cfg.indoor_fill_strength
+
+    # ───────── Rim / Back (轮廓光) ─────────
+    rim = _ensure_light("RS_In_Rim", "SPOT")
+    rim.location = (2.5, 3.5, 3.5)
+    _aim_at(rim, target)  
+    rim.data.spot_size = radians(50)
+    rim.data.shadow_soft_size = 0.4
+    rim.data.energy = 500.0 * cfg.indoor_rim_strength
 
 
 # ---- Weather stubs (future work) ---------------------------------------- #
-def _setup_rain(scene, intensity):   pass   # TODO
-def _clear_rain(scene):              pass
-def _setup_fog(scene, density):      pass   # TODO
-def _clear_fog(scene):               pass
+# ───────── Fog helpers ─────────────────────────────────────────────────────
+_KOSCHMIEDER = 3.912        # MOR ≈ 3.912 / β    (β = extinction coefficient)
 
-# ---------------------------------------------------------------- APPLY ---- #
-def apply(scene: bpy.types.Scene, cfg: RSLightingSettings) -> None:
-    """Entry point called by UI operator."""
+def _clear_fog(scene):
+    world = _ensure_world(scene)
+    nt = world.node_tree
+    for n in list(nt.nodes):
+        if n.name.startswith("RS_Fog"):
+            nt.nodes.remove(n)
+    for l in list(nt.links):
+        if l.is_valid and l.to_socket.identifier == "Volume":
+            nt.links.remove(l)
+
+def _setup_fog(scene, cfg: RSLightingSettings):
+    """Volumetric haze:
+       • Density solved from visibility (MOR) via Koschmieder
+       • Exponentially decays with height
+       • Subtle 3-D noise for realism"""
+    vis = max(cfg.fog_visibility, 1.0)          # avoid ÷0
+    base_density = _KOSCHMIEDER / vis          # m-¹   (works fine for BU≈m)
+
+    _clear_fog(scene)
+    if base_density < 1e-4:                     # almost clear – skip
+        return
+
+    world = _ensure_world(scene)
+    nt = world.node_tree
+
+    # -------------------------------- nodes --------------------------------
+    # Value ▸ base_density  ┐
+    val = nt.nodes.new("ShaderNodeValue");         val.name = "RS_FogBase"
+    val.outputs[0].default_value = base_density
+
+    # Texture Coordinate ▸ Generated ▸ Separate XYZ (take Z) ▸ Map Range
+    tex = nt.nodes.new("ShaderNodeTexCoord");      tex.name = "RS_FogTC"
+    sep = nt.nodes.new("ShaderNodeSeparateXYZ");   sep.name = "RS_FogSep"
+    mrg = nt.nodes.new("ShaderNodeMapRange");      mrg.name = "RS_FogHeight"
+    mrg.inputs["From Min"].default_value = 0.0     # ground
+    mrg.inputs["From Max"].default_value = 20.0    # 20 m ⇒ fully clear
+    mrg.inputs["To Min"].default_value   = 1.0
+    mrg.inputs["To Max"].default_value   = 0.0
+    nt.links.new(tex.outputs["Generated"], sep.inputs["Vector"])
+    nt.links.new(sep.outputs["Z"],        mrg.inputs[0])
+
+    # 3-D Noise
+    # Blender 4.5+ has ShaderNodeVolumeNoise; earlier builds do not.
+    try:
+        noise = nt.nodes.new("ShaderNodeVolumeNoise")   # preferred
+    except (RuntimeError, TypeError, ValueError):
+        # Node type not found → fall back to regular 3-D TexNoise
+        noise = nt.nodes.new("ShaderNodeTexNoise")
+    noise.name = "RS_FogNoise"
+    noise.inputs["Scale"].default_value   = 3.0
+    noise.inputs["Detail"].default_value  = 2.0
+
+    # Math Multiply ×3  (base × height × noise) → Density
+    mul1 = nt.nodes.new("ShaderNodeMath");  mul1.operation = 'MULTIPLY'
+    mul2 = nt.nodes.new("ShaderNodeMath");  mul2.operation = 'MULTIPLY'
+    nt.links.new(val.outputs[0],    mul1.inputs[0])
+    nt.links.new(mrg.outputs[0],    mul1.inputs[1])
+    nt.links.new(mul1.outputs[0],   mul2.inputs[0])
+    nt.links.new(noise.outputs.get("Fac", 0), mul2.inputs[1])
+
+    # Principled Volume (colour slightly bluish-grey)
+    fog = nt.nodes.new("ShaderNodeVolumePrincipled"); fog.name = "RS_Fog"
+    fog.inputs["Color"].default_value   = (0.6, 0.7, 0.8, 1.0)
+    nt.links.new(mul2.outputs[0], fog.inputs["Density"])
+
+    # World Output – Volume socket
+    out = next((n for n in nt.nodes if n.type == 'OUTPUT_WORLD'), None)
+    if out is None:
+        out = nt.nodes.new("ShaderNodeOutputWorld")
+    nt.links.new(fog.outputs["Volume"], out.inputs["Volume"])
+
+
+# === Particle-based rain ===================================================
+def _clear_rain(scene):
+    col = bpy.data.collections.get("RS_Rain")
+    if col:
+        for obj in list(col.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        bpy.data.collections.remove(col, do_unlink=True)
+    for obj_name in ("RS_Raindrop", "RS_RainEmitter"):
+        obj = bpy.data.objects.get(obj_name)
+        if obj:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+
+def _setup_rain(scene, intensity: float):
+    """
+    Creates a simple but convincing rain system:
+    * A hidden raindrop instance object (elongated UV-sphere, glass material)
+    * A large overhead emitter plane with a particle system
+    """
+    if intensity <= 0.0:
+        _clear_rain(scene)
+        return
+
+    # 1. ensure collection
+    col = _ensure_collection("RS_Rain")
+
+    # 2. raindrop object (instanced by particles)
+    drop = bpy.data.objects.get("RS_Raindrop")
+    if drop is None:
+        mesh = bpy.data.meshes.new("RS_RaindropMesh")
+        bm = bmesh.new()
+        bmesh.ops.create_uvsphere(bm, u_segments=6, v_segments=3, radius=0.02)
+        bm.to_mesh(mesh)
+        bm.free()
+
+        drop = bpy.data.objects.new("RS_Raindrop", mesh)
+        drop.scale = (0.3, 0.3, 2.0)                      # streak shape
+        col.objects.link(drop)
+
+        # water material
+        mat = bpy.data.materials.new("RS_RainWater")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        nt.nodes.clear()
+        bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+        # Blender 4.4: Transmission / Roughness sockets renamed.
+        tx_sock = (bsdf.inputs.get("Transmission")
+                   or bsdf.inputs.get("Transmission Weight"))
+        if tx_sock:
+            tx_sock.default_value = 1.0
+
+        rough_sock = (bsdf.inputs.get("Roughness")
+                      or bsdf.inputs.get("Roughness Factor"))
+        if rough_sock:
+            rough_sock.default_value = 0.05
+        out = nt.nodes.new("ShaderNodeOutputMaterial")
+        nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        drop.data.materials.append(mat)
+
+        drop.hide_render   = False          # **must be False or nothing shows up**
+        drop.hide_viewport = True           # still invisible in viewport
+
+    else:
+        # 只有在未链接时才 link，避免 “already in collection” 错误
+        if col not in drop.users_collection:
+            col.objects.link(drop)
+
+
+    # 3. emitter plane
+    emitter = bpy.data.objects.get("RS_RainEmitter")
+    if emitter is None:
+        mesh = bpy.data.meshes.new("RS_RainEmitterMesh")
+        mesh.from_pydata(
+            [(-1, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)], [], [(0, 1, 2, 3)]
+        )
+        emitter = bpy.data.objects.new("RS_RainEmitter", mesh)
+        scene.collection.objects.link(emitter)
+    emitter.scale = (30, 30, 1)
+    emitter.location = (0, 0, 20)
+    if col not in emitter.users_collection:
+        col.objects.link(emitter)
+
+    # 4. particle system (reuse if already present)
+    if emitter.particle_systems:
+        ps = emitter.particle_systems[0]
+    else:
+        ps = emitter.modifiers.new("RS_RainPS", type='PARTICLE_SYSTEM').particle_system
+
+    part = ps.settings
+    part.count = int(40_000 * intensity)               # denser = more obvious
+    part.frame_start = 1
+    part.frame_end = 250
+    part.lifetime = 250
+    part.emit_from = 'FACE'
+    part.physics_type = 'NEWTON'
+    part.normal_factor = 0.0
+    # ---------------------------------------------------------------
+    # Hide emitter plane in renders (API changed in 4.4)
+    if hasattr(part, "use_render_emitter"):       # ≤4.3
+        part.use_render_emitter = False
+    elif hasattr(ps, "show_emitter"):             # ≥4.4 (property on ParticleSystem)
+        ps.show_emitter = False                   # hide in both viewport & render
+    if hasattr(part, "render_type"):
+        part.render_type = 'OBJECT'
+    else:
+        part.render_as   = 'OBJECT'
+    part.instance_object = drop
+    part.particle_size = 0.05
+    if hasattr(part, "mass"):
+        part.mass = 0.01
+    # --- gravity ---------------------------------------------------------
+    if hasattr(part, "gravity"):
+        # Blender ≤4.3
+        part.gravity = (0, 0, -9.81)
+    else:
+        # Blender 4.4 → 通过 effector 权重
+        part.effector_weights.gravity = 1.0
+
+    # --- removed in 4.4 ---------------------------------------------------
+    if hasattr(part, "timestep"):
+        part.timestep = 0.04          # <=4.3 only
+
+    # --- random velocity --------------------------------------------------
+    if hasattr(part, "velocity_factor_random"):
+        part.velocity_factor_random = 0.3
+    elif hasattr(part, "factor_random"):          # 4.4 rename
+        part.factor_random = 0.3
+
+    part.use_rotations = True                          # orient to velocity
+    if hasattr(part, "rotation_mode"):                 # ≤ 4.3
+        part.rotation_mode = 'VEL'
+    elif hasattr(part, "angular_velocity_mode"):       # ≥ 4.4 rename
+        part.angular_velocity_mode = 'VELOCITY'
+
+
+# === Dispatcher – apply() ==================================================
+# ────────── ③ apply()：根据天气决定天空 & 降雨 ──────────
+def apply(scene: bpy.types.Scene, cfg: RSLightingSettings):
+    _ensure_lights_collection()   
+    _clear_lights_collection()  
+    if cfg.location == "INDOOR":
+        _setup_indoor(scene, cfg)
+        _clear_rain(scene); _clear_fog(scene)
+        return   # 后续户外逻辑直接跳过
     if cfg.location == "OUTDOOR":
-        _setup_sky(scene, cfg.cloudiness)
+        # SUNNY → 纯晴空；RAIN → 预设厚云；FOG 单独控制雾
+        sky_cloud = 0.0 if cfg.weather == "SUNNY" else 0.9
+        _setup_sky(scene, sky_cloud)
         _setup_sun(scene, cfg)
     else:
         _setup_indoor(scene)
 
-    # Weather hooks (not yet implemented)
+    # 其他天气效应保持原状
     if cfg.weather == "RAIN":
         _setup_rain(scene, cfg.rain_intensity)
     else:
         _clear_rain(scene)
 
     if cfg.weather == "FOG":
-        _setup_fog(scene, cfg.fog_density)
+        _setup_fog(scene, cfg)
     else:
         _clear_fog(scene)
+# ---------------------------------------------------------------- Operator #
+class RS_OT_ClearLighting(bpy.types.Operator):
+    """Remove every RS-Studio light object, sky, rain/fog, and reset World."""
+    bl_idname = "rs.clear_lighting"
+    bl_label  = "Clear RS Lighting"
+    bl_options = {"REGISTER", "UNDO"}
 
+    def execute(self, ctx):
+        scene = ctx.scene
+
+        # 1) 删除专用 collection 及其对象
+        col = bpy.data.collections.get(_LIGHTS_COLLECTION)
+        if col:
+            for obj in list(col.objects):
+                bpy.data.objects.remove(obj, do_unlink=True)
+            # unlink collection from parents before removing
+            for parent in bpy.data.collections:
+                if col.name in parent.children:
+                    parent.children.unlink(col)
+            bpy.data.collections.remove(col)
+
+        # 2) 兜底：清掉散落在外的 RS_ 前缀灯光
+        for obj in list(bpy.data.objects):
+            if obj.type == 'LIGHT' and obj.name.startswith("RS_"):
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+        # 3) 清雨/雾粒子与天空节点
+        _clear_rain(scene)
+        _clear_fog(scene)
+        _clear_sky(scene)                      # → 中性灰背景
+
+        self.report({'INFO'}, "RS-Studio lighting cleared")
+        return {'FINISHED'}
 
 # ---------------------------------------------------------------- Operator #
 class RS_OT_ApplyLighting(bpy.types.Operator):
@@ -333,4 +686,4 @@ class RS_OT_ApplyLighting(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------- Register #
-CLASSES: List[Type] = [RSLightingSettings, RS_OT_ApplyLighting]
+CLASSES: List[Type] = [RSLightingSettings, RS_OT_ApplyLighting,RS_OT_ClearLighting]

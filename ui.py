@@ -56,13 +56,13 @@ class RS_PT_MainPanel(bpy.types.Panel):
         light.prop(s2, "weather")
 
         # weather-specific sliders
-        if s2.weather in {"CLEAR", "SCATTERED", "OVERCAST"}:
-            light.prop(s2, "cloudiness", slider=True)
+        # Lighting 面板中的天气-相关控件
+        if s2.weather == "SUNNY":
+            light.prop(s2, "sun_intensity", slider=True)
         elif s2.weather == "RAIN":
             light.prop(s2, "rain_intensity", slider=True)
         elif s2.weather == "FOG":
-            light.prop(s2, "fog_density", slider=True)
-
+            light.prop(s2, "fog_visibility", slider=True)
         light.separator()
 
         if s2.location == "OUTDOOR":
@@ -81,6 +81,7 @@ class RS_PT_MainPanel(bpy.types.Panel):
             tz_off = s2.longitude / 15.0
             light.label(text=f"Local TZ ≈ UTC{tz_off:+.1f} h")
         light.operator("rs.apply_lighting", icon='CHECKMARK')
+        light.operator("rs.clear_lighting", icon='TRASH')
         # ─────────────── Post-Import Organiser ─────────────── #
         org = layout.box()
         org.label(text="Scan Post-Import", icon='FILE_REFRESH')
@@ -122,7 +123,20 @@ class RS_PT_MainPanel(bpy.types.Panel):
         ds_box.prop(s, "export_format")
         if s.export_format == "NGP":
             ds_box.prop(s, "aabb_scale")
-
+        # Show depth-fusion point-cloud options when exporting 3DGS (COLMAP)
+        if s.export_format == "COLMAP_3DGS_MESH":  # ← NEW
+            sub = ds_box.box()
+            sub.label(text="Surface-Sampling Point Cloud", icon='POINTCLOUD_DATA')
+            col = sub.column(align=True); col.use_property_split = True
+            col.prop(s, "mesh_points_target")
+            col.prop(s, "mesh_voxel")
+            col.prop(s, "mesh_color_mode")
+            col.separator()
+            col.prop(s, "mesh_visibility_filter")
+            row = col.row(align=True)
+            row.prop(s, "mesh_min_visible_cameras")
+            row.prop(s, "mesh_max_cameras_check")
+            col.prop(s, "mesh_backface_cull")
         if s.is_running:
             if hasattr(ds_box, "progress"):
                 ds_box.progress(factor=s.progress, type="BAR",
