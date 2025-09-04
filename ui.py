@@ -132,11 +132,18 @@ class RS_PT_MainPanel(bpy.types.Panel):
             col.prop(s, "mesh_voxel")
             col.prop(s, "mesh_color_mode")
             col.separator()
-            col.prop(s, "mesh_visibility_filter")
             row = col.row(align=True)
-            row.prop(s, "mesh_min_visible_cameras")
-            row.prop(s, "mesh_max_cameras_check")
-            col.prop(s, "mesh_backface_cull")
+            # --- AABB bounds section (OpenCV/COLMAP world) ---
+            sub2 = ds_box.box()
+            sub2.label(text="AABB Bounds (OpenCV/COLMAP World)", icon='MESH_CUBE')
+            col2 = sub2.column(align=True); col2.use_property_split = True
+            col2.prop(s, "mesh_bounds_enable")
+            row = sub2.row(align=True)
+            row.enabled = s.mesh_bounds_enable
+            cmin = row.column(align=True); cmin.use_property_split = True
+            cmin.prop(s, "mesh_bounds_min")
+            cmax = row.column(align=True); cmax.use_property_split = True
+            cmax.prop(s, "mesh_bounds_max")
         if s.is_running:
             if hasattr(ds_box, "progress"):
                 ds_box.progress(factor=s.progress, type="BAR",

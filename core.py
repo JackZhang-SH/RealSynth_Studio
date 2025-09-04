@@ -449,7 +449,7 @@ class ColmapPoseWriter(DatasetWriter):
         M_w2cv = T @ M_bl.inverted() @ A
 
         R = M_w2cv.to_3x3()
-        t = M_w2cv.to_translation() * self._scale     # 可选全局缩放
+        t = M_w2cv.to_translation()    # 可选全局缩放
         q = R.to_quaternion()                         # (w, x, y, z)
 
         return (q.w, q.x, q.y, q.z, t.x, t.y, t.z)
@@ -648,28 +648,20 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
         max_cams_check   = int(getattr(rs, "mesh_max_cameras_check", 12))
         vis_filter       = bool(getattr(rs, "mesh_visibility_filter", True))
         color_mode       = str(getattr(rs, "mesh_color_mode", "TEXTURE"))  # TEXTURE / VCOL / MATERIAL / WHITE
-
+        # Axis-aligned bounds in OpenCV world (optional)
+        bounds_enable = bool(getattr(rs, "mesh_bounds_enable", False))
+        bmin = getattr(rs, "mesh_bounds_min", (-1e9, -1e9, -1e9))
+        bmax = getattr(rs, "mesh_bounds_max", ( 1e9,  1e9,  1e9))
+        try:
+            bmin_cv = mu.Vector((float(bmin[0]), float(bmin[1]), float(bmin[2])))
+            bmax_cv = mu.Vector((float(bmax[0]), float(bmax[1]), float(bmax[2])))
+        except Exception:
+            bmin_cv = mu.Vector((-1e9, -1e9, -1e9))
+            bmax_cv = mu.Vector(( 1e9,  1e9,  1e9))
         # intrinsics cache per cam
-        w_render = int(scn.render.resolution_x * scn.render.resolution_percentage / 100)
-        h_render = int(scn.render.resolution_y * scn.render.resolution_percentage / 100)
-
         cam_infos = []
-        for cam_obj, _ in items[:max_cams_check]:
-            w,h,fx,fy,cx,cy,_ = _intrinsics_from_cam(cam_obj.data, scn)
-            if (w != w_render) or (h != h_render):
-                # strictly adapt intrinsics to image size actually saved
-                sx, sy = (w_render / w), (h_render / h)
-                fx, fy = fx*sx, fy*sy
-                cx, cy = cx*sx, cy*sy
-                w, h = w_render, h_render
-            R_wc, C_w = extrinsics_cv_from_matrix_world(cam_obj.matrix_world)
-            cam_infos.append({
-                "obj": cam_obj, "R_wc": R_wc, "C_w": C_w,
-                "fx": fx, "fy": fy, "cx": cx, "cy": cy,
-                "w": w_render, "h": h_render,
-                "near": float(cam_obj.data.clip_start),
-                "far":  float(cam_obj.data.clip_end),
-            })
+
+
 
         # depsgraph & evaluated scene for accurate geometry + ray cast
         dg = bpy.context.evaluated_depsgraph_get()
@@ -791,7 +783,29 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
                     p0 = (mw @ me.vertices[vid[0]].co).to_3d()
                     p1 = (mw @ me.vertices[vid[1]].co).to_3d()
                     p2 = (mw @ me.vertices[vid[2]].co).to_3d()
-
+                    if bounds_enable:
+                        p0_cv = A_cv_from_bl.to_3x3() @ p0
+                        p1_cv = A_cv_from_bl.to_3x3() @ p1
+                        p2_cv = A_cv_from_bl.to_3x3() @ p2
+                        tri_min = mu.Vector((
+                            min(p0_cv.x, p1_cv.x, p2_cv.x),
+                            min(p0_cv.y, p1_cv.y, p2_cv.y),
+                            min(p0_cv.z, p1_cv.z, p2_cv.z),
+                        ))
+                        tri_max = mu.Vector((
+                            max(p0_cv.x, p1_cv.x, p2_cv.x),
+                            max(p0_cv.y, p1_cv.y, p2_cv.y),
+                            max(p0_cv.z, p1_cv.z, p2_cv.z),
+                        ))
+                        # Grow a little to catch border triangles (use voxel as tolerance)
+                        eps = max(1e-6, voxel)
+                        tri_min -= mu.Vector((eps, eps, eps))
+                        tri_max += mu.Vector((eps, eps, eps))
+                        # No intersection -> skip
+                        if (tri_max.x < bmin_cv.x or tri_min.x > bmax_cv.x or
+                            tri_max.y < bmin_cv.y or tri_min.y > bmax_cv.y or
+                            tri_max.z < bmin_cv.z or tri_min.z > bmax_cv.z):
+                            continue
                     # Flat normal and area
                     e1 = p1 - p0
                     e2 = p2 - p0
@@ -843,109 +857,91 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
         areas = np.fromiter((t["area"] for t in tris), dtype=np.float64, count=len(tris))
         cdf = np.cumsum(areas); cdf /= cdf[-1]
 
-        # helper projection/visibility
-        def _project_and_visible(Pw_bl: mu.Vector, Nw_bl: mu.Vector) -> bool:
-            """Return True if the Blender-world point is seen by >= min_vis_cams."""
-            if not vis_filter:
-                return True
-            vis_cnt = 0
-            # Convert point to OpenCV world for projection
-            Pw_cv = A_cv_from_bl.to_3x3() @ Pw_bl
-
-            for ci in cam_infos:
-                # backface culling in Blender world (camera pos converted to Blender)
-                Cw_bl = A_bl_from_cv.to_3x3() @ mu.Vector(ci["C_w"])
-                if backface_cull and (Nw_bl.dot(Cw_bl - Pw_bl) <= 0.0):
-                    continue
-
-                # project in OpenCV camera coords
-                Xc = (ci["R_wc"].transposed() @ (mu.Vector((Pw_cv.x, Pw_cv.y, Pw_cv.z)) - mu.Vector(ci["C_w"])))
-                Zc = float(Xc.z)
-                if not (ci["near"] < Zc < ci["far"]):
-                    continue
-                u = ci["fx"] * (Xc.x / Zc) + ci["cx"]
-                v = ci["fy"] * (Xc.y / Zc) + ci["cy"]
-                if not (0.0 <= u < ci["w"] and 0.0 <= v < ci["h"]):
-                    continue
-
-                # occlusion test must be in Blender world
-                origin = Cw_bl
-                dirv   = Pw_bl - origin
-                dist   = max(1e-6, dirv.length)
-                hit, *_ = bpy.context.scene.ray_cast(
-                    dg, origin, dirv.normalized(), distance=dist - 1e-5
-                )
-                if hit:
-                    continue  # blocked
-
-                vis_cnt += 1
-                if vis_cnt >= min_vis_cams:
-                    return True
-            return False
-
-
         # voxel merge accumulators
         vox = max(voxel, 1e-6)
         accum: dict[tuple[int,int,int], list[float]] = {}
         counts: dict[tuple[int,int,int], int] = {}
 
-        # sample loop
-        for _ in range(target_count * 3):  # oversample; visibility + voxel will thin it
-            r = rng.random()
-            idx = int(np.searchsorted(cdf, r, side="right"))
+        # Oversampling budget:
+        # - without AABB: modest trials;
+        # - with AABB: much larger budget since many samples may fall outside.
+        rng = np.random.default_rng(12345)
+        oversample = 10 if not bounds_enable else 200
+        max_trials = max(target_count * oversample, target_count * 3)
+
+        accepted_voxels = 0
+        trials = 0
+
+        while accepted_voxels < target_count and trials < max_trials:
+            trials += 1
+            # area-weighted tri pick
+            idx = int(np.searchsorted(cdf, rng.random(), side="right"))
             if idx >= len(tris):
-                idx = len(tris)-1
+                idx = len(tris) - 1
             t = tris[idx]
-            # barycentric (u,v,w) with sqrt rand for uniform area sampling
+
+            # barycentric sampling (uniform by area)
             r1 = rng.random(); r2 = rng.random()
             su = math.sqrt(r1)
             b0 = 1.0 - su
             b1 = su * (1.0 - r2)
             b2 = su * r2
-            # interpolate position / normal / uv
+
             Pw = (t["p0"] * b0 + t["p1"] * b1 + t["p2"] * b2)
             Nw = (t["n0"] * b0 + t["n1"] * b1 + t["n2"] * b2).normalized()
             uv = (t["uv0"] * b0 + t["uv1"] * b1 + t["uv2"] * b2)
 
-            if not _project_and_visible(Pw, Nw):
-                continue
+            # Keep only points inside the user AABB (OpenCV world) if enabled
+            if bounds_enable:
+                P_cv_for_aabb = A_cv_from_bl.to_3x3() @ Pw
+                if not (bmin_cv.x <= P_cv_for_aabb.x <= bmax_cv.x and
+                        bmin_cv.y <= P_cv_for_aabb.y <= bmax_cv.y and
+                        bmin_cv.z <= P_cv_for_aabb.z <= bmax_cv.z):
+                    continue
 
             # color
             if color_mode == "TEXTURE" and (t["img"] is not None):
                 r,g,b,a = _sample_image_rgba(t["img"], uv)
             elif color_mode == "VCOL":
-                r,g,b,a = (220,220,220,255)  # TODO: vertex-color path (optional)
+                r,g,b,a = (220,220,220,255)
             elif color_mode == "MATERIAL":
                 r,g,b,a = (200,200,200,255)
             else:
                 r,g,b,a = (255,255,255,255)
 
-            # voxel key
+            # voxel key (Blender world)
             k = (int(round(Pw.x/vox)), int(round(Pw.y/vox)), int(round(Pw.z/vox)))
             if k not in accum:
                 accum[k]  = [Pw.x, Pw.y, Pw.z, float(r), float(g), float(b)]
                 counts[k] = 1
+                accepted_voxels += 1
             else:
                 acc = accum[k]; c = counts[k]
                 acc[0] += Pw.x; acc[1] += Pw.y; acc[2] += Pw.z
                 acc[3] += r;    acc[4] += g;    acc[5] += b
                 counts[k] = c + 1
 
-            if len(accum) >= target_count:
-                break
+        # If AABB is enabled and we did not reach the target, tell the user explicitly.
+        if bounds_enable and accepted_voxels < target_count:
+            print(f"[RS-Studio] AABB target {target_count} not reached: got {accepted_voxels} "
+                f"after {trials} trials. Consider expanding bounds or increasing budget.")
 
-        # average within voxels; also convert to OpenCV world (already is)
+        # average within voxels; convert to OpenCV world
         out: list[tuple[float,float,float,int,int,int]] = []
         for k, acc in accum.items():
             c = counts[k]
-            x_bl = acc[0] / c; y_bl = acc[1] / c; z_bl = acc[2] / c
-            P_bl = mu.Vector((x_bl, y_bl, z_bl))
+            P_bl = mu.Vector((acc[0]/c, acc[1]/c, acc[2]/c))
             P_cv = A_cv_from_bl.to_3x3() @ P_bl
-            r = int(round(acc[3] / c))
-            g = int(round(acc[4] / c))
-            b = int(round(acc[5] / c))
-            out.append((float(P_cv.x), float(P_cv.y), float(P_cv.z), r, g, b))
-        print(f"[RS-Studio] frame {frame}: tris={len(tris)} tot_area={tot_area:.3f} "f"target={target_count} vox={voxel} fused_voxels={len(accum)} out_points={len(out)}")
+            out.append((
+                float(P_cv.x), float(P_cv.y), float(P_cv.z),
+                int(round(acc[3]/c)), int(round(acc[4]/c)), int(round(acc[5]/c))
+            ))
+
+        print(
+            f"[RS-Studio] frame {frame}: tris={len(tris)} tot_area={tot_area:.3f} "
+            f"target(in-AABB)={target_count} vox={voxel} trials={trials} "
+            f"fused_voxels={len(accum)} out_points={len(out)}"
+        )
         return out
 
 

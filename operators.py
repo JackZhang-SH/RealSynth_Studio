@@ -309,6 +309,26 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         default="TEXTURE",
         description="How to derive per-point color"
     )
+    # ---- AABB bounds (OpenCV/COLMAP world) ----
+    mesh_bounds_enable: bpy.props.BoolProperty(  # type: ignore
+        name="Limit to Bounds (CV world)",
+        description="Keep only points within the axis-aligned bounds in OpenCV/COLMAP world coordinates",
+        default=False,
+    )
+
+    mesh_bounds_min: bpy.props.FloatVectorProperty(  # type: ignore
+        name="Bounds Min (x,y,z)",
+        description="Lower corner of the AABB in OpenCV/COLMAP world coordinates",
+        size=3, subtype='XYZ',
+        default=(-10.0, -10.0, -10.0),
+    )
+
+    mesh_bounds_max: bpy.props.FloatVectorProperty(  # type: ignore
+        name="Bounds Max (x,y,z)",
+        description="Upper corner of the AABB in OpenCV/COLMAP world coordinates",
+        size=3, subtype='XYZ',
+        default=(10.0, 10.0, 10.0),
+    )
 # --------------------------------------------------------------------------- #
 # Camera-split operator
 # --------------------------------------------------------------------------- #
