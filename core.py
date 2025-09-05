@@ -562,62 +562,115 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
         imgset.color_mode = 'RGB'
         imgset.color_depth = '8'
 
-    # ---- main finish: write poses (txt), then sample surfaces & write ply / points3D
+    def _write_colmap_points3D_bin(self, bin_path: Path,
+                                   pts: list[tuple[float,float,float,float,float,float,int,int,int]]) -> None:
+        """
+        Write a minimal COLMAP-compatible points3D.bin:
+        [num_points: uint64]
+        For each point:
+          point3D_id: uint64
+          X,Y,Z:      float64 x3
+          R,G,B:      uint8   x3
+          ERROR:      float64
+          track_len:  uint64  (0 here)
+          (no (image_id:int32, point2D_idx:int32) pairs since empty track)
+        Normals are not stored in COLMAP's points3D.bin, so they are ignored here.
+        """
+        import struct
+        bin_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(bin_path, "wb") as f:
+            f.write(struct.pack("<Q", len(pts)))
+            pid = 1
+            for x, y, z, nx, ny, nz, r, g, b in pts:
+                f.write(struct.pack("<QdddBBBdQ",
+                                    pid, float(x), float(y), float(z),
+                                    int(r), int(g), int(b),
+                                    0.0, 0))  # ERROR=0.0, track_len=0
+                pid += 1
+
     def finish(self):
-        # 1) write cameras.txt / images.txt / empty points3D.txt (poses-only)
+        # 1) Write cameras.txt / images.txt / empty points3D.txt via parent
         super().finish()
 
-        # 2) for each frame: build surface point cloud with visibility filter
         for frame, items in self._frames.items():
-            frame_dir = self.root / f"frame_{frame}"
-            sparse0   = frame_dir / "sparse" / "0"
-            points_txt = sparse0 / "points3D.txt"
+            frame_dir  = self.root / f"frame_{frame}"
+            sparse0    = frame_dir / "sparse" / "0"
+            txt_points = sparse0 / "points3D.txt"
+            bin_points = sparse0 / "points3D.bin"
 
+            # 2) Build surface-sampled points (OpenCV world, with normals)
             pts = self._sample_surface_points_for_frame(frame, items)
-            self._write_ply(frame_dir / "fused_points.ply", pts)
+            # pts: [(x,y,z, nx,ny,nz, r,g,b), ...]
 
-            # 3) write points3D.txt (OpenCV world)
-            with points_txt.open("w", encoding="utf8") as f:
-                f.write("# 3DGS initialization points generated from mesh surface sampling (OpenCV world)\n")
+            # 3) Write fused_points.ply (with normals), then sync to COLMAP path
+            fused_ply = frame_dir / "fused_points.ply"
+            self._write_ply(fused_ply, pts)
+            # sync for 3DGS convenience
+            try:
+                import shutil
+                shutil.copyfile(fused_ply, sparse0 / "points3D.ply")
+            except Exception as _:
+                pass  # never fail the pipeline on a convenience copy
+
+            # 4) Strict points3D.txt (no header/comment, no track in TXT)
+            with txt_points.open("w", encoding="utf8") as f:
                 pid = 1
-                for (x, y, z, r, g, b) in pts:
-                    f.write(f"{pid} {x} {y} {z} {r} {g} {b} 0.0 0\n")
+                for x, y, z, nx, ny, nz, r, g, b in pts:
+                    # POINT3D_ID X Y Z R G B ERROR
+                    f.write(f"{pid} {x} {y} {z} {int(r)} {int(g)} {int(b)} 0.0\n")
                     pid += 1
 
-            # optional BIN conversion if COLMAP exists
+            # 5) Try TXT->BIN via COLMAP; explicit input/output types; then validate size
             colmap_exe = shutil.which("colmap")
+            need_fallback = False
             if colmap_exe:
                 try:
-                    subprocess.run(
-                        [colmap_exe, "model_converter",
-                         "--input_path",  os.fspath(sparse0),
-                         "--output_path", os.fspath(sparse0),
-                         "--output_type", "BIN"],
-                        check=True, capture_output=True, text=True
-                    )
-                except subprocess.CalledProcessError as e:
-                    print("[RS-Studio] ⚠ model_converter failed; keep .txt:", e.stderr)
-    def _write_ply(self, path: Path, pts: list[tuple[float,float,float,int,int,int]]) -> None:
-        """Write binary little-endian PLY with XYZ + RGB."""
-        import struct
-        path.parent.mkdir(parents=True, exist_ok=True)
-        header = (
-            "ply\n"
-            "format binary_little_endian 1.0\n"
-            f"element vertex {len(pts)}\n"
-            "property float x\n"
-            "property float y\n"
-            "property float z\n"
-            "property uchar red\n"
-            "property uchar green\n"
-            "property uchar blue\n"
-            "end_header\n"
-        ).encode("ascii")
-        with open(path, "wb") as f:
-            f.write(header)
-            pack = struct.Struct("<fffBBB").pack
-            for x, y, z, r, g, b in pts:
-                f.write(pack(float(x), float(y), float(z), int(r), int(g), int(b)))
+                    import subprocess, os
+                    cmd = [
+                        colmap_exe, "model_converter",
+                        "--input_path",  os.fspath(sparse0),
+                        "--output_path", os.fspath(sparse0),
+                        "--input_type",  "TXT",
+                        "--output_type", "BIN",
+                    ]
+                    subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    if (not bin_points.exists()) or (bin_points.stat().st_size <= 64):
+                        need_fallback = True
+                except Exception:
+                    need_fallback = True
+            else:
+                need_fallback = True
+
+            # 6) Fallback: write our own minimal points3D.bin (empty tracks)
+            if need_fallback:
+                self._write_colmap_points3D_bin(bin_points, pts)
+                
+    def _write_ply(self, path: Path, pts: list[tuple[float,float,float,float,float,float,int,int,int]]) -> None:
+            """Write binary little-endian PLY with XYZ + Normal + RGB in that exact order."""
+            import struct
+            path.parent.mkdir(parents=True, exist_ok=True)
+            header = (
+                "ply\n"
+                "format binary_little_endian 1.0\n"
+                f"element vertex {len(pts)}\n"
+                "property float x\n"
+                "property float y\n"
+                "property float z\n"
+                "property float nx\n"
+                "property float ny\n"
+                "property float nz\n"
+                "property uchar red\n"
+                "property uchar green\n"
+                "property uchar blue\n"
+                "end_header\n"
+            ).encode("ascii")
+            with open(path, "wb") as f:
+                f.write(header)
+                pack = struct.Struct("<ffffffBBB").pack
+                for x, y, z, nx, ny, nz, r, g, b in pts:
+                    f.write(pack(float(x), float(y), float(z),
+                                float(nx), float(ny), float(nz),
+                                int(r), int(g), int(b)))
     # ---- core: surface sampling with visibility filtering ------------------
     def _sample_surface_points_for_frame(self, frame: int, items: list[tuple[bpy.types.Object, Path]]):
         """
@@ -643,10 +696,6 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
         # parameters (read from UI; provide robust defaults)
         target_count     = int(getattr(rs, "mesh_points_target", 800_000))
         voxel            = float(getattr(rs, "mesh_voxel", 0.01))
-        min_vis_cams     = int(getattr(rs, "mesh_min_visible_cameras", 1))
-        backface_cull    = bool(getattr(rs, "mesh_backface_cull", True))
-        max_cams_check   = int(getattr(rs, "mesh_max_cameras_check", 12))
-        vis_filter       = bool(getattr(rs, "mesh_visibility_filter", True))
         color_mode       = str(getattr(rs, "mesh_color_mode", "TEXTURE"))  # TEXTURE / VCOL / MATERIAL / WHITE
         # Axis-aligned bounds in OpenCV world (optional)
         bounds_enable = bool(getattr(rs, "mesh_bounds_enable", False))
@@ -658,11 +707,6 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
         except Exception:
             bmin_cv = mu.Vector((-1e9, -1e9, -1e9))
             bmax_cv = mu.Vector(( 1e9,  1e9,  1e9))
-        # intrinsics cache per cam
-        cam_infos = []
-
-
-
         # depsgraph & evaluated scene for accurate geometry + ray cast
         dg = bpy.context.evaluated_depsgraph_get()
 
@@ -912,13 +956,14 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
             # voxel key (Blender world)
             k = (int(round(Pw.x/vox)), int(round(Pw.y/vox)), int(round(Pw.z/vox)))
             if k not in accum:
-                accum[k]  = [Pw.x, Pw.y, Pw.z, float(r), float(g), float(b)]
+                accum[k]  = [Pw.x, Pw.y, Pw.z, float(Nw.x), float(Nw.y), float(Nw.z), float(r), float(g), float(b)]
                 counts[k] = 1
                 accepted_voxels += 1
             else:
                 acc = accum[k]; c = counts[k]
                 acc[0] += Pw.x; acc[1] += Pw.y; acc[2] += Pw.z
-                acc[3] += r;    acc[4] += g;    acc[5] += b
+                acc[3] += Nw.x; acc[4] += Nw.y; acc[5] += Nw.z
+                acc[6] += r;    acc[7] += g;    acc[8] += b
                 counts[k] = c + 1
 
         # If AABB is enabled and we did not reach the target, tell the user explicitly.
@@ -927,15 +972,22 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
                 f"after {trials} trials. Consider expanding bounds or increasing budget.")
 
         # average within voxels; convert to OpenCV world
-        out: list[tuple[float,float,float,int,int,int]] = []
+        out: list[tuple[float,float,float,float,float,float,int,int,int]] = []
+        R_cv_from_bl = A_cv_from_bl.to_3x3()
         for k, acc in accum.items():
             c = counts[k]
+            # 平均位置（Blender 世界）
             P_bl = mu.Vector((acc[0]/c, acc[1]/c, acc[2]/c))
-            P_cv = A_cv_from_bl.to_3x3() @ P_bl
-            out.append((
-                float(P_cv.x), float(P_cv.y), float(P_cv.z),
-                int(round(acc[3]/c)), int(round(acc[4]/c)), int(round(acc[5]/c))
-            ))
+            # 平均法线（Blender 世界 → 归一化）
+            N_bl = mu.Vector((acc[3]/c, acc[4]/c, acc[5]/c)).normalized()
+            # 坐标与法线都转到 OpenCV 世界
+            P_cv = R_cv_from_bl @ P_bl
+            N_cv = (R_cv_from_bl @ N_bl).normalized()
+            # 颜色
+            rr = int(round(acc[6]/c)); gg = int(round(acc[7]/c)); bb = int(round(acc[8]/c))
+            out.append((float(P_cv.x), float(P_cv.y), float(P_cv.z),
+                        float(N_cv.x), float(N_cv.y), float(N_cv.z),
+                        rr, gg, bb))
 
         print(
             f"[RS-Studio] frame {frame}: tris={len(tris)} tot_area={tot_area:.3f} "
