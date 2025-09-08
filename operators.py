@@ -222,6 +222,7 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
             ("TACV",         "TACV",               ""),
             ("COLMAP_POSES", "COLMAP (poses)",     ""),
             ("COLMAP_3DGS_MESH", "3DGS (COLMAP, Surface)", ""), # ← NEW
+            ("COLMAP_3DGS_DEPTH", "3DGS (COLMAP, Depth)",   ""),  # ← NEW
         ],
         default="NGP",
     )# type: ignore
@@ -328,6 +329,29 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         description="Upper corner of the AABB in OpenCV/COLMAP world coordinates",
         size=3, subtype='XYZ',
         default=(10.0, 10.0, 10.0),
+    )
+    # ---- layered sampling (mitigate ground dominance) ----
+    mesh_object_gamma: bpy.props.FloatProperty(      # type: ignore
+        name="Object Weight Gamma",
+        min=0.01, max=1.0, default=0.5,
+        description="Exponent for per-object sampling weight = area^gamma (lower flattens dominance)"
+    )
+    mesh_object_cap_ratio: bpy.props.FloatProperty(  # type: ignore
+        name="Object Cap Ratio",
+        min=0.05, max=1.0, default=0.33,
+        description="Max share of target points any single object can take"
+    )
+
+    # ---- micro thickness (thin shell for stability) ----
+    mesh_thickness_eps: bpy.props.FloatProperty(     # type: ignore
+        name="Micro Thickness (m)",
+        min=0.0, soft_max=0.02, default=0.0,
+        description="Duplicate points at ±epsilon along normal to create a thin shell"
+    )
+    mesh_thickness_two_sided: bpy.props.BoolProperty(# type: ignore
+        name="Two-sided Thickness",
+        default=True,
+        description="If enabled, create both +epsilon and -epsilon copies; if off, only +epsilon"
     )
 # --------------------------------------------------------------------------- #
 # Camera-split operator

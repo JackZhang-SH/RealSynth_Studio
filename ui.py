@@ -144,6 +144,22 @@ class RS_PT_MainPanel(bpy.types.Panel):
             cmin.prop(s, "mesh_bounds_min")
             cmax = row.column(align=True); cmax.use_property_split = True
             cmax.prop(s, "mesh_bounds_max")
+            col.separator()
+            col.label(text="Layered Sampling")
+            col.prop(s, "mesh_object_gamma", slider=True)
+            col.prop(s, "mesh_object_cap_ratio", slider=True)
+
+            col.separator()
+            col.label(text="Micro Thickness")
+            col.prop(s, "mesh_thickness_eps")
+            col.prop(s, "mesh_thickness_two_sided")
+        if s.export_format == "COLMAP_3DGS_DEPTH":
+            sub = ds_box.box()
+            sub.label(text="Depth Back-Projection Point Cloud", icon='POINTCLOUD_DATA')
+            col = sub.column(align=True); col.use_property_split = True
+            col.prop(s, "depth_stride")
+            col.prop(s, "pointcloud_voxel")
+            col.prop(s, "pointcloud_max_points")
         if s.is_running:
             if hasattr(ds_box, "progress"):
                 ds_box.progress(factor=s.progress, type="BAR",
