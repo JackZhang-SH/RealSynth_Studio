@@ -1086,6 +1086,26 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
 
         for frame, items in self._frames.items():
             frame_dir  = self.root / f"frame_{frame}"
+
+            # (Surface route) We do not need depth at all. If a lingering "depth" folder
+            # exists (e.g., from a previous Depth run), remove it to keep the layout clean.
+            # Policy: delete *.exr files under depth/, then remove the directory if empty.
+            try:
+                depth_dir = frame_dir / "depth"
+                if depth_dir.exists() and depth_dir.is_dir():
+                    for exr in list(depth_dir.glob("*.exr")):
+                        try:
+                            exr.unlink()
+                        except Exception:
+                            pass
+                    # remove the folder if it is now empty
+                    try:
+                        next(depth_dir.iterdir())
+                    except StopIteration:
+                        depth_dir.rmdir()
+            except Exception:
+                # Never fail the export just because cleanup did not succeed.
+                pass
             sparse0    = frame_dir / "sparse" / "0"
             txt_points = sparse0 / "points3D.txt"
             bin_points = sparse0 / "points3D.bin"
