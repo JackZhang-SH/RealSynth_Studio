@@ -1593,6 +1593,51 @@ class SamplingStrategy(ABC):
     @abstractmethod
     def sample(self, n: int, radius: float) -> Sequence[Vector]:
         raise NotImplementedError
+    
+# --------------------------------------------------------------------------- #
+# NEW: Elliptical ring sampling (uniform in parameter angle)
+# --------------------------------------------------------------------------- #
+# core.py
+
+class EllipticalRingSampling(SamplingStrategy):
+    """
+    Sample camera positions along an in-plane ellipse:
+      x = cx + a * cos(t)
+      y = cy + b * sin(t)
+      z = cz
+    where `center = (cx, cy, cz)`.
+    Angles are spaced uniformly for even coverage.
+    """
+
+    def __init__(
+        self,
+        a: float,
+        b: float,
+        *,
+        center: Vector | tuple[float, float, float] = (0.0, 0.0, 0.0),
+        angle_offset: float = 0.0,
+        clockwise: bool = False,
+    ):
+        self.a = float(a)
+        self.b = float(b)
+        self.center = center if isinstance(center, Vector) else Vector(center)
+        self.angle_offset = float(angle_offset)
+        self.clockwise = bool(clockwise)
+
+    def sample(self, n: int, radius: float) -> List[Vector]:  # keep signature
+        if n <= 0:
+            return []
+        pts: List[Vector] = []
+        sign = -1.0 if self.clockwise else 1.0
+        two_pi = 2.0 * math.pi
+
+        cx, cy, cz = float(self.center.x), float(self.center.y), float(self.center.z)
+        for i in range(n):
+            t = self.angle_offset + sign * (two_pi * i / n)
+            x = cx + self.a * math.cos(t)
+            y = cy + self.b * math.sin(t)
+            pts.append(Vector((x, y, cz)))
+        return pts
 
 
 class FibonacciSphereSampling(SamplingStrategy):

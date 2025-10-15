@@ -94,7 +94,17 @@ class RS_PT_MainPanel(bpy.types.Panel):
         cam_box.label(text="Camera Generator", icon='CAMERA_DATA')
         cam_box.prop(s, "images_per_frame")
         cam_box.prop(s, "sampling_strategy")
-        cam_box.prop(s, "radius")
+        # Show axis names explicitly for ellipse mode
+        # ui.py — in RS_PT_MainPanel.draw(), ellipse UI block
+        if s.sampling_strategy == "ELLIPSE":
+            col = cam_box.column(align=True); col.use_property_split = True
+            col.prop(s, "radius",        text="Ellipse Semi-Major Axis (a)")
+            col.prop(s, "ellipse_minor", text="Ellipse Semi-Minor Axis (b)")
+            col.prop(s, "ellipse_center", text="Ellipse Center (x,y,z)")  # center only
+
+        else:
+            cam_box.prop(s, "radius", text="Sampling Radius")
+        cam_box.prop(s, "focal_length_mm", text="Focal Length (mm)")
         cam_box.prop(s, "target_point")
 
         row = cam_box.row(align=True)

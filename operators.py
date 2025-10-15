@@ -37,6 +37,7 @@ from .core import (
     ExportFormat,
     FibonacciSphereSampling,
     FibonacciHemisphereSampling,
+    EllipticalRingSampling
 )
 
 # --------------------------------------------------------------------------- #
@@ -180,6 +181,7 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         items=[
             ("HEMI",   "Fibonacci (Upper-Hemisphere)", ""),
             ("SPHERE", "Fibonacci (Full-Sphere)",     ""),
+            ("ELLIPSE","Ellipse (Ring, centered)",     ""),
         ],
         default="HEMI",
     )  # type: ignore
@@ -353,6 +355,23 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         default=True,
         description="If enabled, create both +epsilon and -epsilon copies; if off, only +epsilon"
     )
+    ellipse_minor: bpy.props.FloatProperty(           # type: ignore
+        name="Ellipse Minor Radius (b)",
+        description="Semi-minor axis length for the ellipse (major axis = Sampling Radius)",
+        min=0.1, default=8.0
+    )
+    ellipse_center: bpy.props.FloatVectorProperty(       # type: ignore
+        name="Ellipse Center (x,y,z)",
+        description="World-space center of the ellipse",
+        size=3, subtype='TRANSLATION',
+        default=(0.0, 0.0, 0.0),
+    )
+    # NEW — focal length control
+    focal_length_mm: bpy.props.FloatProperty(         # type: ignore
+        name="Focal Length (mm)",
+        description="Camera focal length in millimeters (perspective cameras)",
+        min=1.0, max=1000.0, default=35.0
+    )   
 # --------------------------------------------------------------------------- #
 # Camera-split operator
 # --------------------------------------------------------------------------- #
@@ -434,8 +453,19 @@ class RS_OT_GenerateCameras(bpy.types.Operator):
             template = context.scene.camera
 
         # ------------------------------------------------ sample positions --
-        Sampler = FibonacciHemisphereSampling if s.sampling_strategy == "HEMI" else FibonacciSphereSampling
-        positions = Sampler().sample(s.images_per_frame, s.radius)
+        # ------------------------------------------------ sample positions --
+        if s.sampling_strategy == "HEMI":
+            positions = FibonacciHemisphereSampling().sample(s.images_per_frame, s.radius)
+        elif s.sampling_strategy == "SPHERE":
+            positions = FibonacciSphereSampling().sample(s.images_per_frame, s.radius)
+
+        else:  # "ELLIPSE"
+            Sampler = EllipticalRingSampling(
+                a=s.radius,
+                b=s.ellipse_minor,
+                center=s.ellipse_center,   # NEW
+            )
+            positions = Sampler.sample(s.images_per_frame, s.radius)
         target = Vector(s.target_point)
 
         # ------------------------------------------------ idx bookkeeping --
@@ -469,7 +499,8 @@ class RS_OT_GenerateCameras(bpy.types.Operator):
 
             cam.location = pos
             cam.rotation_euler = (target - cam.location).to_track_quat("-Z", "Y").to_euler()
-
+            if cam.data is not None and getattr(cam.data, "type", None) == 'PERSP':
+                cam.data.lens = s.focal_length_mm
             _ensure_marker(cam, SPLIT_COLORS["train"], train_col)
 
         # ----------------------------------------- clean up temp template --
