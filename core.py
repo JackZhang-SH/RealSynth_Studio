@@ -216,6 +216,7 @@ class ExportFormat(Enum):
     COLMAP_POSES = auto()      # ----- COLMAP (poses-only) ----
     COLMAP_3DGS_MESH = auto()   # ← NEW: surface-sampling route
     COLMAP_3DGS_DEPTH = auto()  # Depth back-projection route
+    DEPTH_PT     = auto()
 # ──────────────────────────────────────────────────────────── #
 #  New: abstract writer & concrete NGP / NeRF-Synthetic writer
 # ──────────────────────────────────────────────────────────── #
@@ -491,6 +492,40 @@ class ColmapPoseWriter(DatasetWriter):
         scale = scene.render.resolution_percentage / 100.0
         self._width  = int(scene.render.resolution_x * scale)
         self._height = int(scene.render.resolution_y * scale)
+    # --- helper: derive camera index from object name --------------------- #
+    @staticmethod
+    def _cam_index_from_name(name: str) -> int:
+        """
+        Derive a stable integer index from camera object name.
+        Supported:
+        - "RS_Studio_<idx>"        -> <idx>
+        - "Cam_Ring_<idx>"         -> 10000 + <idx>
+        - "Cam_Tile_rR_cC_<side>"  -> 20000 + (R*100 + C*8 + side_id)
+            where side_id: L=0..3, R=4..7 depending on multi-cam count
+        Fallback: last contiguous digit group; return -1 if none.
+        """
+        import re
+
+        m = re.search(r"RS_Studio_(\d+)", name)
+        if m:
+            return int(m.group(1))
+
+        m = re.search(r"Cam_Ring_(\d+)", name)
+        if m:
+            return 10000 + int(m.group(1))
+
+        # Cam_Tile_r{R}_c{C}_L, Cam_Tile_r{R}_c{C}_L2, Cam_Tile_r{R}_c{C}_R3, etc.
+        m = re.search(r"Cam_Tile_r(\d+)_c(\d+)_(L|R)(\d*)", name, re.IGNORECASE)
+        if m:
+            R = int(m.group(1)); C = int(m.group(2))
+            side = m.group(3).upper()
+            idx_str = m.group(4)
+            k = int(idx_str) - 1 if (idx_str and idx_str.isdigit()) else 0  # 0-based within side
+            base = 0 if side == 'L' else 4
+            return 20000 + (R * 100 + C * 8 + base + max(0, min(k, 3)))
+
+        m = re.search(r"(\d+)(?!.*\d)", name)
+        return int(m.group(1)) if m else -1
 
     # ------------------------------------------------------------ helpers ----
     def _blender_to_colmap(self, cam_obj: bpy.types.Object):
@@ -537,18 +572,20 @@ class ColmapPoseWriter(DatasetWriter):
     # ------------------------------------------------ dataset-writer API -----
     def filepath_for(self, cam_obj, _global_idx):
         """
-        Called by FrameDatasetRenderer for every image.
-        Returns absolute path where the render should be saved.
+        Save filename as <cam-index>.png so that image index matches RS_Studio camera index.
+        Falls back to sequential numbering only if no index can be parsed.
         """
         frame = bpy.context.scene.frame_current
-        seq   = self._seq_per_frame.setdefault(frame, 0)
-
         img_dir = self.root / f"frame_{frame}" / "images"
         img_dir.mkdir(parents=True, exist_ok=True)
 
-        path = img_dir / f"{seq:04d}.png"
-        self._seq_per_frame[frame] += 1
-        return path
+        cam_idx = self._cam_index_from_name(cam_obj.name)
+        if cam_idx >= 0:
+            return img_dir / f"{cam_idx:04d}.png"
+        # Fallback: keep previous sequential scheme
+        seq = self._seq_per_frame.setdefault(frame, 0)
+        self._seq_per_frame[frame] = seq + 1
+        return img_dir / f"{seq:04d}.png"
 
     def register_frame(self, cam_obj, img_path: Path):
         """
@@ -770,11 +807,11 @@ class Colmap3DGSDepthWriter(ColmapPoseWriter):
                                     0.0, 0))  # ERROR=0.0, track_len=0
                 pid += 1
 
-    def _prepare_depth_path_for_seq(self, frame: int, seq: int, out_dir: Path) -> Path:
+    def _prepare_depth_path_for_cam(self, frame: int, cam_idx: int, out_dir: Path) -> Path:
         depth_dir = out_dir / f"frame_{frame}" / "depth"
         depth_dir.mkdir(parents=True, exist_ok=True)
         self._fo_node.base_path = os.fspath(depth_dir)
-        name = f"f{frame:04d}_c{seq:04d}"
+        name = f"f{frame:04d}_c{cam_idx:04d}"
         self._fo_slot.path = name
         return depth_dir / f"{name}.exr"
 
@@ -786,14 +823,22 @@ class Colmap3DGSDepthWriter(ColmapPoseWriter):
 
     # ---- hook: return color path and schedule depth path --------------------
     def filepath_for(self, cam_obj, _global_idx):
+        """
+        Use camera index for both color PNG and depth EXR file naming.
+        """
         frame = bpy.context.scene.frame_current
-        seq   = self._seq_per_frame.setdefault(frame, 0)
         img_dir = self.root / f"frame_{frame}" / "images"
         img_dir.mkdir(parents=True, exist_ok=True)
-        color_path = img_dir / f"{seq:04d}.png"
-        depth_path = self._prepare_depth_path_for_seq(frame, seq, self.root)
+
+        cam_idx = self._cam_index_from_name(cam_obj.name)
+        if cam_idx < 0:
+            # Rare fallback: keep sequential scheme if name has no digits
+            cam_idx = self._seq_per_frame.setdefault(frame, 0)
+            self._seq_per_frame[frame] = cam_idx + 1
+
+        color_path = img_dir / f"{cam_idx:04d}.png"
+        depth_path = self._prepare_depth_path_for_cam(frame, cam_idx, self.root)
         self._depth_paths[color_path.resolve()] = depth_path
-        self._seq_per_frame[frame] = seq + 1
         return color_path
 
     def register_frame(self, cam_obj, img_path: Path):
@@ -805,6 +850,12 @@ class Colmap3DGSDepthWriter(ColmapPoseWriter):
         super().finish()
         # Then, for each frame: fuse depth → write PLY and points3D.txt, convert BIN
         for frame, items in self._frames.items():
+            # Sort rows by numeric camera index parsed from object name
+            def _key(it):
+                cam_obj, _ = it
+                ci = self._cam_index_from_name(cam_obj.name)
+                return ci if ci >= 0 else 1_000_000  # unknown indices go last
+            items = sorted(items, key=_key)
             frame_dir  = self.root / f"frame_{frame}"
             sparse0    = frame_dir / "sparse" / "0"
             points_txt = sparse0 / "points3D.txt"
@@ -1582,6 +1633,181 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
             f"[layered: gamma={obj_gamma} cap={obj_cap} thickness={thickness_eps}]"
         )
         return out
+    
+class DepthPTPerCameraWriter(DatasetWriter):
+    """
+    Render per-view depth and save to:
+        frame_{F}/depth_npy/depth_{cameraIndex:04d}.npy  (always)
+        frame_{F}/depth_npy/depth_{cameraIndex:04d}.pt   (optional, if torch importable)
+
+    No temporary folders are left under the dataset root. Intermediate EXR/PNG
+    are written into a system temp directory and deleted immediately.
+    Depth is in meters, top-left image origin, dtype float32, shape (H, W).
+    """
+
+    def __init__(self, root_out: Path, cam0):
+        super().__init__(root_out, cam0)
+
+        import tempfile
+        self._tmp_dir = Path(tempfile.mkdtemp(prefix="rs_depth_")).resolve()
+
+        scn = bpy.context.scene
+        # Ensure Z pass and compositor nodes
+        for vl in scn.view_layers:
+            vl.use_pass_z = True
+        scn.render.use_compositing = True
+        scn.use_nodes = True
+        # Reuse helper from Colmap3DGSDepthWriter
+        self._fo_node, self._fo_slot = Colmap3DGSDepthWriter._ensure_depth_output_node(scn)
+
+        # Color format (only to satisfy Blender's file write; files live in temp and get removed)
+        imgset = scn.render.image_settings
+        imgset.file_format = 'PNG'
+        imgset.color_mode  = 'RGB'
+        imgset.color_depth = '8'
+
+        self._seq_per_frame: dict[int, int] = {}         # frame -> running idx
+        self._depth_path_map: dict[Path, Path] = {}      # temp-color-abs -> expected depth-exr-abs
+
+    # --------------------- helpers --------------------- #
+    def _frame_dir_out(self, frame: int) -> Path:
+        """Return the dataset output directory for this frame (no temp here)."""
+        last = self.root.name.lower()
+        if last == f"frame_{frame}".lower():
+            return self.root
+        return self.root / f"frame_{frame}"
+
+    def _prepare_depth_path(self, frame: int, seq: int) -> Path:
+        """
+        Point the compositor File Output to our temp dir and set slot name.
+        Returns the expected EXR path (actual file may have frame digits appended).
+        """
+        self._fo_node.base_path = os.fspath(self._tmp_dir)
+        name = f"f{frame:04d}_c{seq:04d}"
+        self._fo_slot.path = name
+        return self._tmp_dir / f"{name}.exr"
+
+    @staticmethod
+    def _camera_index_from_name(cam_obj: bpy.types.Object) -> int:
+        # Expect names like "RS_Studio_12_train" → 12
+        import re
+        m = re.search(r"RS_Studio_(\d+)", cam_obj.name)
+        return int(m.group(1)) if m else 0
+
+    @staticmethod
+    def _resolve_depth_file(expected: Path) -> Path | None:
+        """
+        Resolve the actual EXR written by Blender's File Output node.
+        If exact path does not exist, accept suffix frame digits (e.g., ...0001.exr).
+        """
+        if expected.exists():
+            return expected
+        cand = sorted(expected.parent.glob(expected.stem + "*.exr"))
+        return cand[-1] if cand else None
+
+    # ------------------ writer API --------------------- #
+    def filepath_for(self, cam_obj: bpy.types.Object, _global_idx: int) -> Path:
+        """
+        Return a temp PNG path for color (Blender needs a target). The paired
+        depth EXR is configured to land in the same temp dir via compositor.
+        """
+        frame = self._scene.frame_current
+        seq   = self._seq_per_frame.setdefault(frame, 0)
+
+        # temp color PNG (deleted in register_frame)
+        color_path = self._tmp_dir / f"color_f{frame:04d}_c{seq:04d}.png"
+
+        # schedule depth EXR in temp dir
+        depth_exr_expected = self._prepare_depth_path(frame, seq)
+        self._depth_path_map[color_path.resolve()] = depth_exr_expected.resolve()
+
+        self._seq_per_frame[frame] = seq + 1
+        return color_path
+
+    def register_frame(self, cam_obj: bpy.types.Object, rel_path: str) -> None:
+        """
+        Convert the EXR depth (from temp dir) into .npy/.pt under dataset root,
+        then delete the temp EXR and temp color PNG immediately.
+        """
+        # Optional torch: do NOT fail if missing
+        try:
+            import torch
+            _torch_ok = True
+        except Exception:
+            torch = None
+            _torch_ok = False
+
+        import numpy as np
+        import bpy
+
+        # Absolute path of the temp color PNG
+        color_abs = (self.root / rel_path).resolve()
+        if not color_abs.exists():
+            # If Blender wrote directly to absolute temp (common), rel_path may already be absolute
+            color_abs = Path(rel_path).resolve()
+
+        # Resolve EXR (handles auto-appended frame digits)
+        depth_expected = self._depth_path_map.get(color_abs)
+        if depth_expected is None:
+            # Fallback by name stem inside temp dir
+            depth_expected = self._tmp_dir / (Path(color_abs).stem.replace("color_", "f") + ".exr")
+        depth_exr = self._resolve_depth_file(Path(depth_expected))
+        if depth_exr is None:
+            raise FileNotFoundError(
+                f"Depth EXR not found. Expected around: {depth_expected} "
+                f"(File Output node may append frame digits like '...0001.exr')"
+            )
+
+        # Read EXR Z → numpy (H,W), top-left origin
+        dep_img = bpy.data.images.load(os.fspath(depth_exr), check_existing=True)
+        try:
+            dep_img.use_view_as_render = False
+            dep_img.colorspace_settings.name = "Non-Color"
+        except Exception:
+            pass
+        w = int(dep_img.size[0]); h = int(dep_img.size[1])
+        ch = int(getattr(dep_img, "channels", 1) or 1)
+        buf = np.array(dep_img.pixels[:], dtype=np.float32)
+        if buf.size < w * h * ch:
+            bpy.data.images.remove(dep_img)
+            # best effort cleanup of temp files before raising
+            try:
+                if color_abs.exists(): color_abs.unlink()
+                if depth_exr.exists(): depth_exr.unlink()
+            except Exception:
+                pass
+            raise RuntimeError(f"Depth EXR seems empty: {depth_exr}")
+        z = buf[0::ch].reshape(h, w)
+        z = np.flipud(z).astype(np.float32, copy=False)  # top-left image origin
+        bpy.data.images.remove(dep_img)
+
+        # Save under dataset root
+        frame  = self._scene.frame_current
+        cam_idx = self._camera_index_from_name(cam_obj)
+        out_dir = self._frame_dir_out(frame) / "depth_npy"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_base = out_dir / f"depth_{cam_idx:04d}"
+        np.save(os.fspath(out_base.with_suffix(".npy")), z)
+        if _torch_ok:
+            torch.save(torch.from_numpy(z), os.fspath(out_base.with_suffix(".pt")))
+
+        # Cleanup temp files for this view
+        try:
+            if color_abs.exists():
+                color_abs.unlink()
+            if depth_exr.exists():
+                depth_exr.unlink()
+        except Exception:
+            pass
+
+    def finish(self) -> None:
+        """Remove the whole temp directory tree."""
+        import shutil
+        try:
+            if self._tmp_dir.exists():
+                shutil.rmtree(self._tmp_dir)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1780,7 +2006,9 @@ class DatasetGenerator:
             elif self.export_fmt is ExportFormat.COLMAP_3DGS_MESH:
                 writer = Colmap3DGSSurfaceWriter(root_out, cam0)
             elif self.export_fmt is ExportFormat.COLMAP_3DGS_DEPTH:
-                writer = Colmap3DGSDepthWriter(root_out, cam0)            
+                writer = Colmap3DGSDepthWriter(root_out, cam0)          
+            elif self.export_fmt is ExportFormat.DEPTH_PT:
+                writer = DepthPTPerCameraWriter(root_out, cam0)
             else:
                 writer = NGPDatasetWriter(root_out, cam0)
 
@@ -1797,7 +2025,10 @@ class DatasetGenerator:
                     bpy.ops.render.render(write_still=True, use_viewport=False)
 
                     # register relative path
-                    rel = path.relative_to(root_out).as_posix()
+                    try:
+                        rel = path.relative_to(root_out).as_posix()
+                    except Exception:
+                        rel = os.fspath(path)  # absolute temp path is fine; writer can handle it
                     writer.register_frame(cam, rel)
 
                     done += 1

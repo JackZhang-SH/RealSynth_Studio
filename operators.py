@@ -26,6 +26,8 @@ import re
 from pathlib import Path
 import shutil
 from typing import Optional, Dict, Tuple
+from mathutils import Vector, Matrix
+import math
 
 import bpy
 import bpy.path as bpath
@@ -109,6 +111,17 @@ def _get_shared_marker_mesh() -> bpy.types.Mesh:
         bm.free()
     return mesh
 
+def _next_rs_index() -> int:
+    existing = [
+        o for o in bpy.data.objects
+        if o.type == "CAMERA" and o.name.startswith(RS_CAMERA_PREFIX + "_")
+    ]
+    used = {
+        int(m.group(1))
+        for o in existing
+        if (m := re.match(rf"{RS_CAMERA_PREFIX}_(\d+)", o.name))
+    }
+    return (max(used) + 1) if used else 0
 
 def _ensure_marker(
     cam: bpy.types.Object,
@@ -223,8 +236,9 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
             ("NERF_SYNTH",   "NeRF Synthetic",     ""),
             ("TACV",         "TACV",               ""),
             ("COLMAP_POSES", "COLMAP (poses)",     ""),
-            ("COLMAP_3DGS_MESH", "3DGS (COLMAP, Surface)", ""), # ← NEW
-            ("COLMAP_3DGS_DEPTH", "3DGS (COLMAP, Depth)",   ""),  # ← NEW
+            ("COLMAP_3DGS_MESH", "3DGS (COLMAP, Surface)", ""), 
+            ("COLMAP_3DGS_DEPTH", "3DGS (COLMAP, Depth)",   ""),  
+            ("DEPTH_PT", "Depth (.npy + optional .pt)", ""),  # saves .npy always; .pt if torch is available
         ],
         default="NGP",
     )# type: ignore
@@ -372,6 +386,90 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         description="Camera focal length in millimeters (perspective cameras)",
         min=1.0, max=1000.0, default=35.0
     )   
+    # ---------- Stadium (Ring + Tile) ----------
+    pitch_length_m: bpy.props.FloatProperty(  # type: ignore
+        name="Pitch Length (m)", min=10.0, default=105.0,
+        description="Field length (X axis), e.g., 105 m"
+    )
+    pitch_width_m: bpy.props.FloatProperty(   # type: ignore
+        name="Pitch Width (m)", min=10.0, default=68.0,
+        description="Field width (Y axis), e.g., 68 m"
+    )
+
+    # Ring cameras
+    ring_k: bpy.props.IntProperty(            # type: ignore
+        name="Ring Count (k)", min=1, max=360, default=12,
+        description="Number of panoramic cameras on the ring"
+    )
+    ring_radius_m: bpy.props.FloatProperty(   # type: ignore
+        name="Ring Radius (m)", min=1.0, default=65.0
+    )
+    ring_height_m: bpy.props.FloatProperty(   # type: ignore
+        name="Ring Height (m)", min=0.1, default=25.0
+    )
+    tile_row_stagger_ratio: bpy.props.FloatProperty(  # type: ignore
+        name="Row Stagger X Ratio",
+        description="Shift X per row to avoid overlaps; 0 disables row-stagger",
+        min=0.0, max=1.0, default=0.33
+    )
+
+    # Tiles (Nx × Ny), m cameras per tile placed near sidelines
+    tiles_nx: bpy.props.IntProperty(          # type: ignore
+        name="Tiles X (Nx)", min=1, default=6
+    )
+    tiles_ny: bpy.props.IntProperty(          # type: ignore
+        name="Tiles Y (Ny)", min=1, default=3
+    )
+    tile_cams_per_zone: bpy.props.IntProperty(  # type: ignore
+        name="Cams per Tile (m)", min=1, max=16, default=2,
+        description="Number of near long-lens cameras per tile"
+    )
+    tile_side_mode: bpy.props.EnumProperty(     # type: ignore
+        name="Side Mode",
+        description="How to place m cameras with respect to sidelines",
+        items=[
+            ("BOTH", "Both Sides (split L/R)", "Split m evenly on left/right"),
+            ("NEAREST", "Nearest Sideline", "Place all m on the nearest sideline"),
+        ],
+        default="BOTH",
+    )
+    sideline_out_offset_m: bpy.props.FloatProperty(  # type: ignore
+        name="Sideline Offset (m)", min=0.0, default=6.0,
+        description="Offset outside sidelines for long-lens cameras"
+    )
+    tile_cam_height_m: bpy.props.FloatProperty(      # type: ignore
+        name="Tile Cam Height (m)", min=0.1, default=2.5
+    )
+    tile_multi_dx_ratio: bpy.props.FloatProperty(    # type: ignore
+        name="Multi-cam X Offset Ratio", min=0.0, max=1.0, default=0.25,
+        description="Spread multiple cams along X inside one tile: offset = k * ratio * tile_dx"
+    )
+    ring_lens_mm: bpy.props.FloatProperty( # type: ignore
+        name="Ring Lens (mm)",
+        description="Focal length for ring cameras",
+        min=1.0, max=1000.0, default=35.0,
+    )
+
+    tile_lens_mm: bpy.props.FloatProperty( # type: ignore
+        name="Tile Lens (mm)", 
+        description="Focal length for tile cameras",
+        min=1.0, max=1000.0, default=102.0,  # ≈ 36mm sensor & ~20° FoVx
+    )
+    # Lens & clipping for both groups
+    sensor_width_mm: bpy.props.FloatProperty(        # type: ignore
+        name="Sensor Width (mm)", min=1.0, max=100.0, default=36.0
+    )
+    stadium_clip_start: bpy.props.FloatProperty(     # type: ignore
+        name="Clip Start", min=0.001, default=0.1
+    )
+    stadium_clip_end: bpy.props.FloatProperty(       # type: ignore
+        name="Clip End", min=10.0, default=1000.0
+    )
+    stadium_clear_old: bpy.props.BoolProperty(       # type: ignore
+        name="Clear Old", default=True,
+        description="Delete existing Cam_Ring_* / Cam_Tile_* before generating"
+    )
+
 # --------------------------------------------------------------------------- #
 # Camera-split operator
 # --------------------------------------------------------------------------- #
@@ -537,6 +635,35 @@ class RS_OT_ClearCameras(bpy.types.Operator):
         self.report({"INFO"}, f"Removed {len(cams)} cameras")
         return {"FINISHED"}
     
+class RS_OT_ClearStadiumCameras(bpy.types.Operator):
+    bl_idname = "rs.clear_stadium_cameras"
+    bl_label  = "Clear Stadium Cameras"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        # remove RS_Studio cameras that were generated by Stadium layout
+        cams = [
+            o for o in bpy.data.objects
+            if o.type == 'CAMERA'
+            and o.name.startswith(RS_CAMERA_PREFIX + "_")
+            and o.get("rs_group") == "stadium"
+        ]
+        n = 0
+        for cam in cams:
+            m = _get_marker(cam)
+            if m:
+                bpy.data.objects.remove(m, do_unlink=True)
+            bpy.data.objects.remove(cam, do_unlink=True)
+            n += 1
+
+        # also remove helper empties (TileCenter)
+        helpers = [o for o in bpy.data.objects if o.type == 'EMPTY' and o.name.startswith("TileCenter_")]
+        for o in helpers:
+            bpy.data.objects.remove(o, do_unlink=True)
+
+        self.report({'INFO'}, f"Removed {n} stadium RS camera(s) and {len(helpers)} helper(s)")
+        return {"FINISHED"}
+
 # ───────────────────────── Import cameras ───────────────────────── #
 class RS_OT_ImportCameras(bpy.types.Operator):
     """Import external cameras → RS-Studio cameras (default *train*)."""
@@ -639,8 +766,14 @@ class RS_OT_GenerateDataset(bpy.types.Operator):
             self.report({"WARNING"},
                 "未检测到 COLMAP，可执行文件 'colmap' 不在 PATH，已降级为 “COLMAP (poses only)”")
         rs_cams = [
-            o for o in bpy.data.objects if o.type == "CAMERA" and o.name.startswith(RS_CAMERA_PREFIX)
+            o for o in bpy.data.objects
+            if o.type == "CAMERA" and (
+                o.name.startswith(RS_CAMERA_PREFIX) or
+                o.name.startswith("Cam_Ring_") or
+                o.name.startswith("Cam_Tile_")
+            )
         ]
+
         if not rs_cams:
             self.report({"ERROR"}, "No RS Studio cameras found – generate cameras first")
             return {"CANCELLED"}
@@ -850,6 +983,211 @@ class RS_OT_OrganizeScan(bpy.types.Operator):
 
         self.report({'INFO'}, f"Organised {len(selected)} object(s)")
         return {'FINISHED'}
+# ---------- Stadium layout (Ring + Tiles) generator ----------
+
+
+class RS_OT_GenerateStadiumCameras(bpy.types.Operator):
+    """Generate stadium RS_Studio cameras (Train split only, with marker).
+       All cameras live directly under:
+         RS_Studio_Camera → Train Cameras
+    """
+    bl_idname = "rs.generate_stadium_cameras"
+    bl_label  = "Generate Stadium Cameras"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        import math, re, bpy
+        from mathutils import Vector
+
+        s = context.scene.rs_settings
+
+        # ---------------- helpers ----------------
+        def set_look_at(cam_obj: bpy.types.Object, target: Vector) -> None:
+            cam_obj.rotation_euler = (target - cam_obj.location).to_track_quat("-Z", "Y").to_euler()
+
+        def next_rs_index(prefix: str) -> int:
+            used = set()
+            for o in bpy.data.objects:
+                if o.type == 'CAMERA' and o.name.startswith(prefix + "_"):
+                    m = re.match(rf"{re.escape(prefix)}_(\d+)", o.name)
+                    if m:
+                        used.add(int(m.group(1)))
+            return (max(used) + 1) if used else 0
+
+        def link_once(col: bpy.types.Collection, obj: bpy.types.Object) -> None:
+            if col not in obj.users_collection:
+                col.objects.link(obj)
+
+        # RS prefix fallback
+        try:
+            rs_prefix = RS_CAMERA_PREFIX
+        except NameError:
+            rs_prefix = "RS_Studio"
+
+        # RS Studio split collections (root/train/valid/test)
+        subcols   = _ensure_collections()
+        train_col = subcols["train"]  # <- ONLY destination collection
+
+        # -------------- optional cleanup --------------
+        if getattr(s, "stadium_clear_old", True):
+            # delete last batch of stadium RS cameras (+ markers)
+            to_remove = [
+                o for o in bpy.data.objects
+                if o.type == 'CAMERA'
+                and o.name.startswith(rs_prefix + "_")
+                and o.get("rs_group") == "stadium"
+            ]
+            for o in to_remove:
+                m = _get_marker(o)          # do NOT create new marker here
+                if m:
+                    bpy.data.objects.remove(m, do_unlink=True)
+                bpy.data.objects.remove(o, do_unlink=True)
+
+            # helpers
+            helpers = [o for o in bpy.data.objects if o.type == 'EMPTY' and o.name.startswith("TileCenter_")]
+            for o in helpers:
+                bpy.data.objects.remove(o, do_unlink=True)
+
+            # legacy visual-only (top-level RingCams/TileCams) — just in case, purge contents
+            for lc_name in ("RingCams", "TileCams"):
+                lc = bpy.data.collections.get(lc_name)
+                if lc and lc != train_col:
+                    for o in list(lc.objects):
+                        if o.name.startswith(("Cam_Ring_", "Cam_Tile_", "TileCenter_")):
+                            bpy.data.objects.remove(o, do_unlink=True)
+
+        # -------------- RS Studio camera factory --------------
+        next_idx = next_rs_index(rs_prefix)
+
+        def spawn_rs_cam(
+            alias: str,
+            location: Vector,
+            target: Vector,
+            lens_mm: float,
+            stadium_sub: str,                     # "ring" | "tile"
+            extra_meta: dict | None = None
+        ) -> bpy.types.Object:
+            """Create a train-split RS camera and its marker directly under Train collection."""
+            nonlocal next_idx
+            cam_name = f"{rs_prefix}_{next_idx}_train"
+
+            cam_data = bpy.data.cameras.new(cam_name + "_data")
+            cam_obj  = bpy.data.objects.new(cam_name, cam_data)
+
+            # link ONLY to Train collection (no sub-collections)
+            link_once(train_col, cam_obj)
+
+            # optics by lens (mm)
+            cam_data.sensor_fit   = 'HORIZONTAL'
+            cam_data.sensor_width = s.sensor_width_mm
+            cam_data.clip_start   = s.stadium_clip_start
+            cam_data.clip_end     = s.stadium_clip_end
+            cam_data.lens         = float(lens_mm)
+
+            # pose
+            cam_obj.location = Vector(location)
+            set_look_at(cam_obj, target)
+
+            # tags
+            cam_obj["rs_group"] = "stadium"
+            cam_obj["rs_sub"]   = stadium_sub
+            cam_obj["rs_alias"] = alias
+            if extra_meta:
+                for k, v in extra_meta.items():
+                    cam_obj[k] = v
+
+            # marker lives in Train collection as well
+            _ensure_marker(cam_obj, SPLIT_COLORS["train"], train_col)
+
+            next_idx += 1
+            return cam_obj
+
+        # ==================== RING ====================
+        k = max(1, int(s.ring_k))
+        for i in range(k):
+            ang = 2.0 * math.pi * (i / k)
+            x = s.ring_radius_m * math.cos(ang)
+            y = s.ring_radius_m * math.sin(ang)
+            z = s.ring_height_m
+            alias = f"Cam_Ring_{i:03d}"
+            spawn_rs_cam(
+                alias=alias,
+                location=Vector((x, y, z)),
+                target=Vector((0.0, 0.0, 0.0)),
+                lens_mm=s.ring_lens_mm,
+                stadium_sub="ring",
+            )
+
+        # ==================== TILES (row-stagger along sideline) ====================
+        NX = max(1, int(s.tiles_nx))
+        NY = max(1, int(s.tiles_ny))
+        dx = s.pitch_length_m / NX
+        dy = s.pitch_width_m  / NY
+        x0 = -s.pitch_length_m * 0.5 + dx * 0.5
+        y0 = -s.pitch_width_m  * 0.5 + dy * 0.5
+
+        left_y  = -s.pitch_width_m * 0.5 - s.sideline_out_offset_m
+        right_y =  s.pitch_width_m  * 0.5 + s.sideline_out_offset_m
+        m_total = max(1, int(s.tile_cams_per_zone))
+
+        # row-stagger to avoid overlaps across rows (0 disables)
+        row_stagger_ratio = getattr(s, "tile_row_stagger_ratio", 0.33)
+
+        for r in range(NY):
+            for c in range(NX):
+                cx = x0 + c * dx
+                cy = y0 + r * dy
+                center = Vector((cx, cy, 0.0))
+
+                # helper empty also lives directly under Train
+                empty = bpy.data.objects.new(f"TileCenter_r{r}_c{c}", None)
+                link_once(train_col, empty)
+                empty.location = center
+
+                # base X with row-stagger, symmetric around middle row
+                base_x = cx + ((r - (NY - 1) * 0.5) * (dx * row_stagger_ratio))
+
+                def place_side(side: str, count: int, y_pos: float):
+                    if count <= 0:
+                        return
+                    offsets = [(k - (count - 1) * 0.5) * (dx * s.tile_multi_dx_ratio) for k in range(count)]
+                    for idx_local, off in enumerate(offsets, start=1):
+                        suffix = "" if count == 1 else str(idx_local)
+                        alias  = f"Cam_Tile_r{r}_c{c}_{side}{suffix}"
+                        spawn_rs_cam(
+                            alias=alias,
+                            location=Vector((base_x + off, y_pos, s.tile_cam_height_m)),
+                            target=center,
+                            lens_mm=s.tile_lens_mm,
+                            stadium_sub="tile",
+                            extra_meta={"rs_tile_r": r, "rs_tile_c": c, "rs_side": side, "rs_idx_in_tile": idx_local},
+                        )
+
+                if s.tile_side_mode == "NEAREST":
+                    distL = abs(cy - (-s.pitch_width_m * 0.5))
+                    distR = abs(cy - ( s.pitch_width_m * 0.5))
+                    if distL <= distR:
+                        place_side("L", m_total, left_y)
+                    else:
+                        place_side("R", m_total, right_y)
+                else:
+                    left_count  = m_total // 2
+                    right_count = m_total // 2
+                    if m_total % 2 == 1:
+                        distL = abs(cy - (-s.pitch_width_m * 0.5))
+                        distR = abs(cy - ( s.pitch_width_m * 0.5))
+                        if distL <= distR: left_count += 1
+                        else:              right_count += 1
+                    place_side("L", left_count,  left_y)
+                    place_side("R", right_count, right_y)
+        s.cameras_generated = True
+        self.report({'INFO'}, "Stadium RS cameras generated under Train (no sub-collections)")
+        return {"FINISHED"}
+
+
+
+
+
 
 # --------------------------------------------------------------------------- #
 # Register new operator                                                       #
@@ -873,4 +1211,6 @@ CLASSES = [
     RS_OT_SetCameraSplit,
     RS_OT_ImportCameras,    
     RS_OT_OrganizeScan,
+    RS_OT_GenerateStadiumCameras,
+    RS_OT_ClearStadiumCameras, 
 ]

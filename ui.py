@@ -90,6 +90,8 @@ class RS_PT_MainPanel(bpy.types.Panel):
         row.prop(s, "scan_fix_scale", text="Scale ↔ 1 m")
         row.prop(s, "scan_fix_material", text="Fix Material")
         # ─────────────── Camera Rig ─────────────── #
+
+
         cam_box = layout.box()
         cam_box.label(text="Camera Generator", icon='CAMERA_DATA')
         cam_box.prop(s, "images_per_frame")
@@ -123,6 +125,38 @@ class RS_PT_MainPanel(bpy.types.Panel):
         op.split = 'test'
 
         layout.separator()
+        # ---------- Stadium Layout (Ring + Tiles) ----------
+        sl = cam_box.box()
+        sl.label(text="Stadium Layout (Ring + Tiles)", icon='OUTLINER_OB_GROUP_INSTANCE')
+        col = sl.column(align=True); col.use_property_split = True
+
+        # field
+        col.prop(s, "pitch_length_m"); col.prop(s, "pitch_width_m")
+
+        # ring
+        col.separator(); col.label(text="Ring")
+        col.prop(s, "ring_k"); col.prop(s, "ring_radius_m")
+        col.prop(s, "ring_lens_mm", text="Ring Lens (mm)")  # ← replace ring_fovx_deg
+
+        # tiles
+        col.separator(); col.label(text="Tiles")
+        row = col.row(align=True); row.prop(s, "tiles_nx"); row.prop(s, "tiles_ny")
+        col.prop(s, "tile_cams_per_zone")
+        col.prop(s, "tile_side_mode")
+        col.prop(s, "sideline_out_offset_m")
+        col.prop(s, "tile_cam_height_m")
+        col.prop(s, "tile_lens_mm", text="Tile Lens (mm)")  # ← replace tile_fovx_deg
+        col.prop(s, "tile_multi_dx_ratio")
+        col.prop(s, "tile_row_stagger_ratio")
+        # lens & clipping
+        col.separator(); col.label(text="Lens & Clipping")
+        col.prop(s, "sensor_width_mm")
+        row = col.row(align=True); row.prop(s, "stadium_clip_start"); row.prop(s, "stadium_clip_end")
+        col.prop(s, "stadium_clear_old")
+
+        row = sl.row(align=True)
+        row.operator("rs.generate_stadium_cameras", icon='CAMERA_DATA', text="Generate Stadium Cams")
+        row.operator("rs.clear_stadium_cameras",   icon='TRASH',       text="Clear Stadium Cams")
 
         # ───────────── Dataset Generation ───────────── #
         ds_box = layout.box()
