@@ -252,7 +252,24 @@ class DatasetWriter(ABC):
 
     @abstractmethod
     def finish(self) -> None:         # called once after all frames done
+        """Called once after all frames have been rendered and registered."""
         ...
+
+    # ---------- new optional hooks for per-frame / multi-stage export --------- #
+    def flush_frame(self, frame: int) -> None:
+        """
+        Optional hook: called by DatasetGenerator after each animation frame
+        has finished rendering all cameras. Default is no-op.
+        """
+        return None
+
+    def finish_all_frames(self) -> None:
+        """
+        Wrapper used by DatasetGenerator. Subclasses can override this if they
+        need more control. By default it simply calls `finish()`.
+        """
+        self.finish()
+
     # 额外步数（供进度条预估）；渲染张数外的附加步骤写在这里
     @property
     def extra_steps(self) -> int:
@@ -262,6 +279,7 @@ class DatasetWriter(ABC):
     def postprocess_iter(self) -> Iterator[None]:
         if False:
             yield None
+
     # apply global scale to translation part of a 4×4 matrix
     def _matrix(self, mat):
         m = [list(r) for r in mat]
@@ -1132,82 +1150,125 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
                 pid += 1
 
     def finish(self):
-        # 1) Write cameras.txt / images.txt / empty points3D.txt via parent
+        """
+        First write poses (cameras.txt / images.txt / empty points3D.txt)
+        via the parent ColmapPoseWriter, then, for each frame, switch the
+        scene to that frame and sample the mesh surface to build a per-frame
+        point cloud. This guarantees that each frame's points come from the
+        correct animated scene state.
+        """
+        # 1) Write cameras/images and placeholder points3D.txt
         super().finish()
 
-        for frame, items in self._frames.items():
-            frame_dir  = self.root / f"frame_{frame}"
+        scene = bpy.context.scene
+        prev_frame = scene.frame_current
 
-            # (Surface route) We do not need depth at all. If a lingering "depth" folder
-            # exists (e.g., from a previous Depth run), remove it to keep the layout clean.
-            # Policy: delete *.exr files under depth/, then remove the directory if empty.
-            try:
-                depth_dir = frame_dir / "depth"
-                if depth_dir.exists() and depth_dir.is_dir():
-                    for exr in list(depth_dir.glob("*.exr")):
-                        try:
-                            exr.unlink()
-                        except Exception:
-                            pass
-                    # remove the folder if it is now empty
-                    try:
-                        next(depth_dir.iterdir())
-                    except StopIteration:
-                        depth_dir.rmdir()
-            except Exception:
-                # Never fail the export just because cleanup did not succeed.
-                pass
-            sparse0    = frame_dir / "sparse" / "0"
-            txt_points = sparse0 / "points3D.txt"
-            bin_points = sparse0 / "points3D.bin"
+        try:
+            for frame, items in self._frames.items():
+                # Make sure the evaluated mesh corresponds to this animation frame
+                scene.frame_set(frame)
 
-            # 2) Build surface-sampled points (OpenCV world, with normals)
-            pts = self._sample_surface_points_for_frame(frame, items)
-            # pts: [(x,y,z, nx,ny,nz, r,g,b), ...]
+                frame_dir = self.root / f"frame_{frame}"
 
-            # 3) Write fused_points.ply (with normals), then sync to COLMAP path
-            fused_ply = frame_dir / "fused_points.ply"
-            self._write_ply(fused_ply, pts)
-            # sync for 3DGS convenience
-            try:
-                import shutil
-                shutil.copyfile(fused_ply, sparse0 / "points3D.ply")
-            except Exception as _:
-                pass  # never fail the pipeline on a convenience copy
-
-            # 4) Strict points3D.txt (no header/comment, no track in TXT)
-            with txt_points.open("w", encoding="utf8") as f:
-                pid = 1
-                for x, y, z, nx, ny, nz, r, g, b in pts:
-                    # POINT3D_ID X Y Z R G B ERROR
-                    f.write(f"{pid} {x} {y} {z} {int(r)} {int(g)} {int(b)} 0.0\n")
-                    pid += 1
-
-            # 5) Try TXT->BIN via COLMAP; explicit input/output types; then validate size
-            colmap_exe = shutil.which("colmap")
-            need_fallback = False
-            if colmap_exe:
+                # (Surface route) We do not need depth at all. If a lingering "depth" folder
+                # exists (for example from a previous depth-based export), clean it up.
                 try:
-                    import subprocess, os
-                    cmd = [
-                        colmap_exe, "model_converter",
-                        "--input_path",  os.fspath(sparse0),
-                        "--output_path", os.fspath(sparse0),
-                    ]
-                    if _colmap_supports_input_type_option(colmap_exe):
-                        cmd += ["--input_type", "TXT"]
-                    cmd += ["--output_type", "BIN"]
-                    subprocess.run(cmd, check=True, capture_output=True, text=True)
-                    if (not bin_points.exists()) or (bin_points.stat().st_size <= 64):
-                        need_fallback = True
+                    depth_dir = frame_dir / "depth"
+                    if depth_dir.exists() and depth_dir.is_dir():
+                        for exr in list(depth_dir.glob("*.exr")):
+                            try:
+                                exr.unlink()
+                            except Exception:
+                                pass
+                        # remove the folder if it is now empty
+                        try:
+                            next(depth_dir.iterdir())
+                        except StopIteration:
+                            depth_dir.rmdir()
                 except Exception:
-                    need_fallback = True
-            else:
-                need_fallback = True
+                    # Never fail the export just because cleanup did not succeed.
+                    pass
 
-            # 6) Fallback: write our own minimal points3D.bin (empty tracks)
-            if need_fallback:
-                self._write_colmap_points3D_bin(bin_points, pts)
+                sparse0 = frame_dir / "sparse" / "0"
+                txt_points = sparse0 / "points3D.txt"
+                bin_points = sparse0 / "points3D.bin"
+
+                # 2) Build surface-sampled points (OpenCV world, with normals)
+                pts = self._sample_surface_points_for_frame(frame, items)
+                # pts: [(x, y, z, nx, ny, nz, r, g, b), ...]
+
+                # 3) Write fused_points.ply (with normals), then sync to COLMAP path
+                fused_ply = frame_dir / "fused_points.ply"
+                self._write_ply(fused_ply, pts)
+                # convenience copy next to COLMAP sparse model
+                try:
+                    import shutil
+
+                    shutil.copyfile(fused_ply, sparse0 / "points3D.ply")
+                except Exception:
+                    # Do not abort on a failed convenience copy.
+                    pass
+
+                # 4) Strict points3D.txt (no header, no track information)
+                with txt_points.open("w", encoding="utf8") as f:
+                    pid = 1
+                    for x, y, z, nx, ny, nz, r, g, b in pts:
+                        # POINT3D_ID X Y Z R G B ERROR
+                        f.write(
+                            f"{pid} {x} {y} {z} "
+                            f"{int(r)} {int(g)} {int(b)} 0.0\n"
+                        )
+                        pid += 1
+
+                # 5) Try to convert TXT -> BIN via COLMAP; then validate output size
+                colmap_exe = shutil.which("colmap")
+                need_fallback = False
+                if colmap_exe:
+                    try:
+                        import subprocess
+                        import os
+
+                        cmd = [
+                            colmap_exe,
+                            "model_converter",
+                            "--input_path",
+                            os.fspath(sparse0),
+                            "--output_path",
+                            os.fspath(sparse0),
+                        ]
+                        if _colmap_supports_input_type_option(colmap_exe):
+                            cmd += ["--input_type", "TXT"]
+                        cmd += ["--output_type", "BIN"]
+                        subprocess.run(
+                            cmd,
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if (not bin_points.exists()) or (
+                            bin_points.stat().st_size <= 64
+                        ):
+                            need_fallback = True
+                    except Exception:
+                        need_fallback = True
+
+                if need_fallback:
+                    # If COLMAP is missing or produced a suspiciously small file,
+                    # fall back to our own binary writer.
+                    try:
+                        self._write_colmap_points3D_bin(bin_points, pts)
+                    except Exception as _:
+                        # Last resort: leave only TXT and log the problem.
+                        print(
+                            "[RS-Studio] Warning: failed to create points3D.bin; "
+                            "3DGS can still use TXT/PLY."
+                        )
+        finally:
+            # Restore the original frame so we do not leave the scene at an arbitrary frame
+            try:
+                scene.frame_set(prev_frame)
+            except Exception:
+                pass
                 
     def _write_ply(self, path: Path, pts: list[tuple[float,float,float,float,float,float,int,int,int]]) -> None:
             """Write binary little-endian PLY with XYZ + Normal + RGB in that exact order."""
@@ -1963,94 +2024,132 @@ class CameraRig:
 
 
 class DatasetGenerator:
+    """Drive multi-camera, multi-frame dataset export via a DatasetWriter."""
+
     # 新增 export_format 参数
     def __init__(self, *, cameras, start_frame, end_frame,
                  export_fmt: ExportFormat = ExportFormat.NGP):
         if end_frame < start_frame:
             raise ValueError("end_frame must be ≥ start_frame")
+
         self._colmap_ok = bool(shutil.which("colmap"))
-        self.cameras = list(cameras)
+        self.cameras: list[bpy.types.Object] = list(cameras)
         self.start   = int(start_frame)
         self.end     = int(end_frame)
         self.export_fmt = export_fmt
+
         frame_cnt = self.end - self.start + 1
-        if export_fmt is ExportFormat.COLMAP_3DGS_MESH and self._colmap_ok:
-            per_frame_extra = 3
+        # 初步估计：仅按「渲染张数」计算；真正 total_steps 会在 iter_generate 里
+        self.total_images = len(self.cameras) * frame_cnt
+
+    # ------------------------------------------------------------------ helpers
+    def _make_writer(self, root_out: Path) -> DatasetWriter:
+        """
+        Factory: choose the proper DatasetWriter based on export_fmt.
+        All writers assume a single shared intrinsics camera (cam0).
+        """
+        if not self.cameras:
+            raise RuntimeError("DatasetGenerator: no cameras provided")
+
+        cam_obj0 = self.cameras[0]
+        if cam_obj0.type != "CAMERA":
+            raise TypeError("cameras must be CAMERA objects")
+        cam0 = cam_obj0.data  # bpy.types.Camera
+
+        if self.export_fmt is ExportFormat.NGP:
+            return NGPDatasetWriter(root_out, cam0)
+        elif self.export_fmt is ExportFormat.NERF_SYNTH:
+            return NeRFSyntheticWriter(root_out, cam0)
+        elif self.export_fmt is ExportFormat.TACV:
+            return TACVDatasetWriter(root_out, cam0)
+        elif self.export_fmt is ExportFormat.COLMAP_POSES:
+            return ColmapPoseWriter(root_out, cam0)
+        elif self.export_fmt is ExportFormat.COLMAP_3DGS_DEPTH:
+            return Colmap3DGSDepthWriter(root_out, cam0)
+        elif self.export_fmt is ExportFormat.COLMAP_3DGS_MESH:
+            return Colmap3DGSSurfaceWriter(root_out, cam0)
+        elif self.export_fmt is ExportFormat.DEPTH_PT:
+            return DepthPTPerCameraWriter(root_out, cam0)
         else:
-            per_frame_extra = 0
-        self.total_images = len(self.cameras) * frame_cnt + per_frame_extra
-                
-    # core.py  — inside class DatasetGenerator
-    def iter_generate(self, output_dir: str | Path):
-        from bpy.types import RenderSettings
+            raise ValueError(f"Unknown export format: {self.export_fmt!r}")
+
+    # ============================================================================ #
+    # Per–frame export: image → writer bookkeeping → (optional) point cloud
+    # ============================================================================ #
+    def iter_generate(self, root_out: Path):
+        """
+        Incrementally generate a dataset *frame by frame*.
+
+        For each frame:
+            1) scene.frame_set(frame)
+            2) for each camera, ask writer.filepath_for(...) for the image path
+            3) render to that path
+            4) register the (camera, relative_path) to the writer
+            5) after all cameras of this frame: writer.flush_frame(frame)
+        After all frames:
+            6) writer.finish_all_frames()
+            7) optional extra steps via writer.postprocess_iter()
+
+        This preserves each writer's custom naming conventions
+        (COLMAP indices, NGP train/val/test splits, depth temp dirs, etc.).
+        """
+        import os
+
         scene = bpy.context.scene
-        prev_engine = scene.render.engine
-        engines = {e.identifier for e in RenderSettings.bl_rna.properties["engine"].enum_items}
-        preferred = "BLENDER_EEVEE_NEXT" if "BLENDER_EEVEE_NEXT" in engines else "CYCLES"
-        if scene.render.engine == "BLENDER_WORKBENCH":
-            scene.render.engine = preferred
+        prev_frame = scene.frame_current
 
-        writer = None  # ← ensure we can call finish() even if something fails early
-        try:
-            root_out = Path(bpath.abspath(str(output_dir))).resolve()
-            root_out.mkdir(parents=True, exist_ok=True)
+        root_out = Path(root_out)
+        root_out.mkdir(parents=True, exist_ok=True)
 
-            cam0 = self.cameras[0].data
-            # --- choose writer ---
-            if self.export_fmt is ExportFormat.COLMAP_POSES:
-                writer = ColmapPoseWriter(root_out, cam0)
-            elif self.export_fmt is ExportFormat.NERF_SYNTH:
-                writer = NeRFSyntheticWriter(root_out, cam0)
-            elif self.export_fmt is ExportFormat.TACV:
-                writer = TACVDatasetWriter(root_out, cam0)
-            elif self.export_fmt is ExportFormat.COLMAP_3DGS_MESH:
-                writer = Colmap3DGSSurfaceWriter(root_out, cam0)
-            elif self.export_fmt is ExportFormat.COLMAP_3DGS_DEPTH:
-                writer = Colmap3DGSDepthWriter(root_out, cam0)          
-            elif self.export_fmt is ExportFormat.DEPTH_PT:
-                writer = DepthPTPerCameraWriter(root_out, cam0)
-            else:
-                writer = NGPDatasetWriter(root_out, cam0)
+        writer = self._make_writer(root_out)
 
-            self._writer_inst = writer
+        frame_cnt = self.end - self.start + 1
+        num_renders = frame_cnt * len(self.cameras)
+        total_steps = num_renders + max(0, int(getattr(writer, "extra_steps", 0)))
+        self.total_images = total_steps
 
-            # --- render loop ---
-            done = 0
-            for frame_idx in range(self.start, self.end + 1):
-                scene.frame_set(frame_idx)
-                for cam in self.cameras:
-                    path = writer.filepath_for(cam, done)
-                    scene.camera = cam
-                    scene.render.filepath = str(path)
-                    bpy.ops.render.render(write_still=True, use_viewport=False)
+        done = 0
 
-                    # register relative path
-                    try:
-                        rel = path.relative_to(root_out).as_posix()
-                    except Exception:
-                        rel = os.fspath(path)  # absolute temp path is fine; writer can handle it
-                    writer.register_frame(cam, rel)
+        # ----------------------------------------------------------- render loop
+        for frame in range(self.start, self.end + 1):
+            scene.frame_set(frame)
 
-                    done += 1
-                    yield done, self.total_images
+            for cam in self.cameras:
+                scene.camera = cam
 
-            # --- optional postprocess ---
-            for _ in writer.postprocess_iter():
+                # Ask writer for the exact filepath (may be in temp dir, or under root_out)
+                img_path = writer.filepath_for(cam, done)
+                img_path = Path(img_path)
+                img_path.parent.mkdir(parents=True, exist_ok=True)
+
+                scene.render.filepath = os.fspath(img_path)
+                bpy.ops.render.render(write_still=True, use_viewport=False)
+
+                # Register path for writer: prefer path relative to root_out,
+                # but fall back to absolute string if it's outside (e.g. temp dir).
+                try:
+                    rel = img_path.relative_to(root_out).as_posix()
+                except ValueError:
+                    rel = os.fspath(img_path)
+
+                writer.register_frame(cam, rel)
+
                 done += 1
-                yield done, self.total_images
+                yield done, total_steps
 
-            # normal finish
-            writer.finish()
+            # 该帧所有 camera 渲染完毕后，给 writer 一次机会做 per-frame 处理
+            writer.flush_frame(frame)
 
-        except Exception as e:
-            print("[RS-Studio] Generation aborted:", e)
-            import traceback; traceback.print_exc()
-            # still try to salvage poses/points/ply
-            try:
-                if writer is not None:
-                    writer.finish()
-            except Exception as e2:
-                print("[RS-Studio] finish() also failed:", e2)
+        # ----------------------------------------------------------------- finish
+        writer.finish_all_frames()
 
-        finally:
-            scene.render.engine = prev_engine
+        # 如果某些 writer 想把耗时操作拆成多个 step，可以在 postprocess_iter 里 yield
+        for _ in writer.postprocess_iter():
+            done += 1
+            yield done, total_steps
+
+        # Restore original frame to avoid side-effects in Blender
+        scene.frame_set(prev_frame)
+
+        # 保证最后一次回调是 “已完成”
+        yield total_steps, total_steps

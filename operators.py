@@ -469,6 +469,65 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         name="Clear Old", default=True,
         description="Delete existing Cam_Ring_* / Cam_Tile_* before generating"
     )
+    tile_row_stagger_ratio: bpy.props.FloatProperty(  # type: ignore
+        name="Row Stagger X Ratio",
+        description="Shift X per row to avoid overlaps; 0 disables row-stagger",
+        min=0.0, max=1.0, default=0.33
+    )
+
+    # Goal-line cameras (short edges, behind goals)
+    goal_enable: bpy.props.BoolProperty(              # type: ignore
+        name="Enable Goal-line Cams",
+        description="If enabled, add cameras along the short edges (behind goals)",
+        default=False,
+    )
+    goal_cams_per_side: bpy.props.IntProperty(        # type: ignore
+        name="Cams per Side",
+        description="Number of cameras on each short edge (positive/negative X)",
+        min=1, max=64, default=4,
+    )
+    goal_out_offset_m: bpy.props.FloatProperty(       # type: ignore
+        name="Goal-line Offset (m)",
+        description="Offset outside the short edge (along +X / -X) for goal-line cameras",
+        min=0.0, default=5.0,
+    )
+    goal_cam_height_m: bpy.props.FloatProperty(       # type: ignore
+        name="Goal-line Cam Height (m)",
+        description="Height of goal-line cameras above ground",
+        min=0.1, default=3.0,
+    )
+    goal_lens_mm: bpy.props.FloatProperty(            # type: ignore
+        name="Goal-line Lens (mm)",
+        description="Focal length for goal-line cameras",
+        min=1.0, max=1000.0, default=70.0,
+    )
+        # Goal-line target control
+    goal_target_use_penalty: bpy.props.BoolProperty(  # type: ignore
+        name="Aim at Penalty Spot",
+        description="If enabled, aim goal-line cameras at the penalty spot in front of each goal",
+        default=True,
+    )
+    goal_penalty_dist_m: bpy.props.FloatProperty(  # type: ignore
+        name="Penalty Distance (m)",
+        description="Distance from goal line into the field for the penalty spot",
+        min=0.0, default=11.0,
+    )
+    goal_target_custom_x_m: bpy.props.FloatProperty(  # type: ignore
+        name="Custom Target X (m)",
+        description="Custom world-space X coordinate for goal-line target when not using penalty spot",
+        default=0.0,
+    )
+    goal_target_custom_y_m: bpy.props.FloatProperty(  # type: ignore
+        name="Custom Target Y (m)",
+        description="Custom world-space Y coordinate for goal-line target when not using penalty spot",
+        default=0.0,
+    )
+    goal_target_custom_z_m: bpy.props.FloatProperty(  # type: ignore
+        name="Custom Target Z (m)",
+        description="Custom world-space Z coordinate for goal-line target when not using penalty spot",
+        default=0.0,
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Camera-split operator
@@ -1180,6 +1239,58 @@ class RS_OT_GenerateStadiumCameras(bpy.types.Operator):
                         else:              right_count += 1
                     place_side("L", left_count,  left_y)
                     place_side("R", right_count, right_y)
+   # ==================== GOAL-LINE CAMERAS (short edges) ====================
+        if getattr(s, "goal_enable", False):
+            n_goal = max(1, int(s.goal_cams_per_side))
+
+            # inner goal-line positions on field (x at the short edges)
+            x_in_pos = s.pitch_length_m * 0.5
+            x_in_neg = -s.pitch_length_m * 0.5
+
+            # actual camera X positions behind the goals
+            x_pos = x_in_pos + s.goal_out_offset_m
+            x_neg = x_in_neg - s.goal_out_offset_m
+
+            # target points for each side
+            if getattr(s, "goal_target_use_penalty", True):
+                # penalty spot in front of the goal, on the field center line (y = 0, z = 0)
+                penalty_dist = max(0.0, float(s.goal_penalty_dist_m))
+                target_pos = Vector((x_in_pos - penalty_dist, 0.0, 0.0))
+                target_neg = Vector((x_in_neg + penalty_dist, 0.0, 0.0))
+            else:
+                # same custom point for both sides (world coordinates)
+                target_custom = Vector((
+                    float(s.goal_target_custom_x_m),
+                    float(s.goal_target_custom_y_m),
+                    float(s.goal_target_custom_z_m),
+                ))
+                target_pos = target_custom
+                target_neg = target_custom
+
+            # distribute cameras evenly along pitch width (Y axis)
+            for side_label, x_goal, target in (
+                ("XPOS", x_pos, target_pos),
+                ("XNEG", x_neg, target_neg),
+            ):
+                for i in range(n_goal):
+                    # t ∈ (0,1), map to Y ∈ [-width/2, width/2]
+                    t = (i + 0.5) / n_goal
+                    y = (t - 0.5) * s.pitch_width_m
+
+                    location = Vector((x_goal, y, s.goal_cam_height_m))
+                    alias   = f"Cam_Goal_{side_label}_{i:02d}"
+
+                    spawn_rs_cam(
+                        alias=alias,
+                        location=location,
+                        target=target,
+                        lens_mm=s.goal_lens_mm,
+                        stadium_sub="goal",
+                        extra_meta={
+                            "rs_side": side_label,
+                            "rs_goal_index": i,
+                        },
+                    )
         s.cameras_generated = True
         self.report({'INFO'}, "Stadium RS cameras generated under Train (no sub-collections)")
         return {"FINISHED"}

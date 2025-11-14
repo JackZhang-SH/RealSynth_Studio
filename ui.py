@@ -137,7 +137,7 @@ class RS_PT_MainPanel(bpy.types.Panel):
         col.separator(); col.label(text="Ring")
         col.prop(s, "ring_k"); col.prop(s, "ring_radius_m")
         col.prop(s, "ring_lens_mm", text="Ring Lens (mm)")  # ← replace ring_fovx_deg
-
+        col.prop(s, "ring_height_m") 
         # tiles
         col.separator(); col.label(text="Tiles")
         row = col.row(align=True); row.prop(s, "tiles_nx"); row.prop(s, "tiles_ny")
@@ -148,7 +148,30 @@ class RS_PT_MainPanel(bpy.types.Panel):
         col.prop(s, "tile_lens_mm", text="Tile Lens (mm)")  # ← replace tile_fovx_deg
         col.prop(s, "tile_multi_dx_ratio")
         col.prop(s, "tile_row_stagger_ratio")
+        # goal-line (short edges)
+        col.separator(); col.label(text="Goal-line (Short Edges)")
+        col.prop(s, "goal_enable")
+        goal_col = col.column(align=True); goal_col.use_property_split = True
+        goal_col.enabled = s.goal_enable
+        goal_col.prop(s, "goal_cams_per_side")
+        goal_col.prop(s, "goal_out_offset_m")
+        goal_col.prop(s, "goal_cam_height_m")
+        goal_col.prop(s, "goal_lens_mm", text="Goal-line Lens (mm)")
+        # goal-line target
+        goal_col.separator(); goal_col.label(text="Goal-line Target")
+        goal_col.prop(s, "goal_target_use_penalty")
+        penalty_col = goal_col.column(align=True)
+        penalty_col.enabled = s.goal_target_use_penalty
+        penalty_col.prop(s, "goal_penalty_dist_m", text="Penalty Dist (m)")
+
+        custom_col = goal_col.column(align=True)
+        custom_col.enabled = not s.goal_target_use_penalty
+        row = custom_col.row(align=True)
+        row.prop(s, "goal_target_custom_x_m", text="X")
+        row.prop(s, "goal_target_custom_y_m", text="Y")
+        row.prop(s, "goal_target_custom_z_m", text="Z")
         # lens & clipping
+
         col.separator(); col.label(text="Lens & Clipping")
         col.prop(s, "sensor_width_mm")
         row = col.row(align=True); row.prop(s, "stadium_clip_start"); row.prop(s, "stadium_clip_end")
