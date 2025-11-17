@@ -241,6 +241,57 @@ class RS_PT_MainPanel(bpy.types.Panel):
             if not s.cameras_generated:
                 ds_box.label(text="Generate / import cameras first",
                              icon='INFO')
+                
+class RS_PT_CameraTrack(bpy.types.Panel):
+    bl_label = "Camera Track → 3DGS"
+    bl_idname = "RS_PT_camera_track"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "RS Studio"
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.rs_settings
+
+        col = layout.column(align=True)
+        col.prop(s, "track_camera")
+        col.prop(s, "track_mode")
+
+        if s.track_mode in {"ORBIT", "LINEAR", "FOLLOW"}:
+            col.separator()
+        if s.track_mode == "ORBIT":
+            col.label(text="Orbit Settings:")
+            col.prop(s, "track_orbit_center")
+            col.prop(s, "track_orbit_radius")
+            col.prop(s, "track_orbit_height")
+            col.prop(s, "track_orbit_start_deg")
+            col.prop(s, "track_orbit_end_deg")
+            col.prop(s, "track_target")
+        elif s.track_mode == "LINEAR":
+            col.label(text="Linear Settings:")
+            col.prop(s, "track_linear_start")
+            col.prop(s, "track_linear_end")
+            col.prop(s, "track_target")
+        elif s.track_mode == "FOLLOW":
+            col.label(text="Follow Settings:")
+            col.prop(s, "track_target")
+            col.prop(s, "track_follow_offset")
+
+        col.separator()
+        col.label(text="Frame Range:")
+        row = col.row(align=True)
+        row.prop(s, "track_frame_start")
+        row.prop(s, "track_frame_end")
+
+        col.separator()
+        col.operator("rs.build_camera_track", text="Build Track (Keyframes)")
+
+        col.separator()
+        col.prop(s, "track_out_path")
+        col.operator("rs.export_camera_track", text="Export Camera Track (JSON)")
+
 
 
 CLASSES.append(RS_PT_MainPanel)
+CLASSES.append(RS_PT_CameraTrack)
+

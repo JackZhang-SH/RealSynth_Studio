@@ -527,7 +527,96 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         description="Custom world-space Z coordinate for goal-line target when not using penalty spot",
         default=0.0,
     )
+    # -------- Camera Track core --------
+    track_camera: bpy.props.PointerProperty(  # type: ignore
+        name="Track Camera",
+        description="Camera used for 3DGS camera track export",
+        type=bpy.types.Object,
+    )
 
+    track_mode: bpy.props.EnumProperty(  # type: ignore
+        name="Track Mode",
+        items=[
+            ("KEYFRAMED", "Keyframed", "Use existing keyframes / constraints"),
+            ("ORBIT",     "Orbit Arc", "Generate an orbit / arc around a target"),
+            ("LINEAR",    "Linear",    "Generate a straight translation track"),
+            ("FOLLOW",    "Follow",    "Follow a target object with offset"),
+        ],
+        default="KEYFRAMED",
+    )
+
+    track_target: bpy.props.PointerProperty(  # type: ignore
+        name="Target",
+        description="Target object to look at / follow",
+        type=bpy.types.Object,
+    )
+
+    # Frame range for export / auto-keyframing
+    track_frame_start: bpy.props.IntProperty(  # type: ignore
+        name="Start Frame",
+        default=1,
+        min=1,
+    )
+    track_frame_end: bpy.props.IntProperty(  # type: ignore
+        name="End Frame",
+        default=250,
+        min=1,
+    )
+
+    # Orbit parameters (in meters & degrees, Blender world)
+    track_orbit_center: bpy.props.FloatVectorProperty(  # type: ignore
+        name="Orbit Center",
+        description="World-space center of the orbit",
+        default=(0.0, 0.0, 0.0),
+        subtype='XYZ',
+    )
+    track_orbit_radius: bpy.props.FloatProperty(  # type: ignore
+        name="Radius (m)",
+        default=30.0,
+        min=0.1,
+    )
+    track_orbit_height: bpy.props.FloatProperty(  # type: ignore
+        name="Height (m)",
+        default=10.0,
+    )
+    track_orbit_start_deg: bpy.props.FloatProperty(  # type: ignore
+        name="Start Angle (deg)",
+        default=-60.0,
+    )
+    track_orbit_end_deg: bpy.props.FloatProperty(  # type: ignore
+        name="End Angle (deg)",
+        default=60.0,
+    )
+
+    # Linear track parameters
+    track_linear_start: bpy.props.FloatVectorProperty(  # type: ignore
+        name="Start Position",
+        description="World-space start position",
+        default=(0.0, -40.0, 10.0),
+        subtype='XYZ',
+    )
+    track_linear_end: bpy.props.FloatVectorProperty(  # type: ignore
+        name="End Position",
+        description="World-space end position",
+        default=(0.0, 40.0, 10.0),
+        subtype='XYZ',
+    )
+
+    # Follow parameters: offset from target in target local or world
+    track_follow_offset: bpy.props.FloatVectorProperty(  # type: ignore
+        name="Follow Offset",
+        description="Offset from target in world space",
+        default=(0.0, -15.0, 5.0),
+        subtype='XYZ',
+    )
+
+    # Export path
+    track_out_path: bpy.props.StringProperty(  # type: ignore
+        name="Track JSON",
+        description="Output path for camera track JSON",
+        subtype='FILE_PATH',
+        default="//camera_track.json",
+    )
 
 # --------------------------------------------------------------------------- #
 # Camera-split operator
@@ -582,6 +671,169 @@ class RS_OT_SetCameraSplit(bpy.types.Operator):
         else:
             self.report({"INFO"}, f"{changed} camera(s) set to {self.split}")
         return {"FINISHED"}
+class RS_OT_BuildCameraTrack(bpy.types.Operator):
+    """Generate camera animation (orbit / linear / follow).
+
+    For 'KEYFRAMED' mode, this does nothing: you keyframe manually.
+    """
+    bl_idname = "rs.build_camera_track"
+    bl_label = "Build Camera Track"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scn = context.scene
+        s = scn.rs_settings
+        cam_obj = s.track_camera
+
+        if cam_obj is None or cam_obj.type != 'CAMERA':
+            self.report({'ERROR'}, "Please select a valid track camera")
+            return {'CANCELLED'}
+
+        mode = s.track_mode
+        if mode == "KEYFRAMED":
+            self.report({'INFO'}, "KEYFRAMED mode: nothing to build (use your own keyframes).")
+            return {'FINISHED'}
+
+        frame_start = max(1, s.track_frame_start)
+        frame_end   = max(frame_start, s.track_frame_end)
+        n_frames = frame_end - frame_start
+        if n_frames <= 0:
+            self.report({'ERROR'}, "Invalid frame range")
+            return {'CANCELLED'}
+
+        target = s.track_target
+        from mathutils import Vector
+
+        def _look_at(obj, target_pos: Vector):
+            obj.rotation_euler = (target_pos - obj.location).to_track_quat("-Z", "Y").to_euler()
+
+        # 清掉旧关键帧（只清当前相机的 loc/rot）
+        cam_obj.animation_data_clear()
+
+        if mode == "ORBIT":
+            import math
+            center = Vector(s.track_orbit_center)
+            radius = s.track_orbit_radius
+            height = s.track_orbit_height
+            a0 = math.radians(s.track_orbit_start_deg)
+            a1 = math.radians(s.track_orbit_end_deg)
+
+            for f in range(frame_start, frame_end + 1):
+                t = (f - frame_start) / max(1, (frame_end - frame_start))
+                angle = a0 + t * (a1 - a0)
+                # 在 X-Y 平面绕 center 旋转，Z 固定为 height
+                x = center.x + radius * math.cos(angle)
+                y = center.y + radius * math.sin(angle)
+                z = center.z + height
+                scn.frame_set(f)
+                cam_obj.location = (x, y, z)
+                if target is not None:
+                    _look_at(cam_obj, target.location)
+                cam_obj.keyframe_insert(data_path="location", frame=f)
+                cam_obj.keyframe_insert(data_path="rotation_euler", frame=f)
+
+        elif mode == "LINEAR":
+            start_pos = Vector(s.track_linear_start)
+            end_pos   = Vector(s.track_linear_end)
+            for f in range(frame_start, frame_end + 1):
+                t = (f - frame_start) / max(1, (frame_end - frame_start))
+                pos = (1.0 - t) * start_pos + t * end_pos
+                scn.frame_set(f)
+                cam_obj.location = pos
+                if target is not None:
+                    _look_at(cam_obj, target.location)
+                cam_obj.keyframe_insert(data_path="location", frame=f)
+                cam_obj.keyframe_insert(data_path="rotation_euler", frame=f)
+
+        elif mode == "FOLLOW":
+            if target is None:
+                self.report({'ERROR'}, "FOLLOW mode requires a target object")
+                return {'CANCELLED'}
+            offset = Vector(s.track_follow_offset)
+
+            for f in range(frame_start, frame_end + 1):
+                scn.frame_set(f)
+                tpos = target.matrix_world.translation
+                cam_obj.location = tpos + offset
+                _look_at(cam_obj, tpos)
+                cam_obj.keyframe_insert(data_path="location", frame=f)
+                cam_obj.keyframe_insert(data_path="rotation_euler", frame=f)
+
+        self.report({'INFO'}, f"Built {mode} track keyframes for camera '{cam_obj.name}'")
+        return {'FINISHED'}
+from .core import _intrinsics_from_cam, extrinsics_cv_from_matrix_world
+
+class RS_OT_ExportCameraTrack(bpy.types.Operator):
+    """Export an animated camera as a 3DGS camera track JSON."""
+    bl_idname = "rs.export_camera_track"
+    bl_label = "Export Camera Track (JSON)"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        import json
+        from mathutils import Matrix
+
+        scn = context.scene
+        s = scn.rs_settings
+        cam_obj = s.track_camera
+
+        if cam_obj is None or cam_obj.type != 'CAMERA':
+            self.report({'ERROR'}, "Please select a valid track camera")
+            return {'CANCELLED'}
+
+        frame_start = max(1, s.track_frame_start)
+        frame_end   = max(frame_start, s.track_frame_end)
+        if frame_end < frame_start:
+            self.report({'ERROR'}, "Invalid frame range")
+            return {'CANCELLED'}
+
+        # Intrinsics (re-eval each frame in case resolution / lens is animated)
+        out_list = []
+
+        # Resolve output path
+        out_path = bpy.path.abspath(s.track_out_path)
+        if not out_path.lower().endswith(".json"):
+            out_path += ".json"
+
+        for f in range(frame_start, frame_end + 1):
+            scn.frame_set(f)
+
+            w, h, fx, fy, cx, cy, _dist = _intrinsics_from_cam(cam_obj.data, scn)
+
+            # Extrinsics in OpenCV convention
+            R_wc_mu, C_w_mu = extrinsics_cv_from_matrix_world(cam_obj.matrix_world)
+            # R_wc_mu: mathutils.Matrix (world->camera transposed), C_w_mu: mathutils.Vector
+            R_cw = R_wc_mu.transposed()
+            t_cw = -(R_cw @ C_w_mu)
+
+            # Convert to plain Python lists (3x3 matrix, 3-vector)
+            R = [[float(v) for v in row] for row in R_cw]
+            T = [float(t_cw.x), float(t_cw.y), float(t_cw.z)]
+
+            item = {
+                "frame": int(f),
+                "width": int(w),
+                "height": int(h),
+                "fx": float(fx),
+                "fy": float(fy),
+                "cx": float(cx),
+                "cy": float(cy),
+                "R": R,
+                "T": T,
+                "znear": float(cam_obj.data.clip_start),
+                "zfar": float(cam_obj.data.clip_end),
+            }
+            out_list.append(item)
+
+        try:
+            with open(out_path, "w", encoding="utf8") as f:
+                json.dump(out_list, f, indent=2)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to write JSON: {e}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Exported {len(out_list)} track frames to {out_path}")
+        return {'FINISHED'}
 
 
 # --------------------------------------------------------------------------- #
@@ -1323,5 +1575,8 @@ CLASSES = [
     RS_OT_ImportCameras,    
     RS_OT_OrganizeScan,
     RS_OT_GenerateStadiumCameras,
-    RS_OT_ClearStadiumCameras, 
+    RS_OT_ClearStadiumCameras,
+    # NEW: camera track operators
+    RS_OT_BuildCameraTrack,
+    RS_OT_ExportCameraTrack,
 ]
