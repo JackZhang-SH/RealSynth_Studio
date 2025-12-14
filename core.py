@@ -675,6 +675,69 @@ def _reproj_sanity_check(scene, cam_obj, *, samples=300):
         # Older API fallback
         dg = bpy.context.view_layer.depsgraph
     verts = []
+    # --- render visibility helpers (object + layer collection + instances) ---
+    view_layer = bpy.context.view_layer
+
+    # Map each Collection in this view layer to its effective render-hidden state.
+    _col_hidden: dict = {}
+
+    def _walk_layer_collection(lc, parent_hidden: bool = False) -> None:
+        hidden = parent_hidden or bool(getattr(lc, "exclude", False)) or bool(getattr(lc, "hide_render", False))
+        _col_hidden[lc.collection] = hidden
+        for ch in lc.children:
+            _walk_layer_collection(ch, hidden)
+
+    try:
+        _walk_layer_collection(view_layer.layer_collection, False)
+    except Exception:
+        _col_hidden = {}
+
+    def _hidden_by_layer_collections(obj) -> bool:
+        cols = getattr(obj, "users_collection", [])
+        if not cols:
+            return False
+        # If the object does not belong to ANY render-enabled collection in this view layer, treat as hidden.
+        for c in cols:
+            # If a collection is not present in this view layer tree, treat it as hidden.
+            if not _col_hidden.get(c, True):
+                return False
+        return True
+
+    def _is_render_hidden(obj) -> bool:
+        if obj is None:
+            return False
+        if getattr(obj, "hide_render", False):
+            return True
+        orig = getattr(obj, "original", None)
+        if orig is not None and getattr(orig, "hide_render", False):
+            return True
+        if _hidden_by_layer_collections(obj):
+            return True
+        # Optional: view-layer visibility (covers some exclusions/overrides)
+        try:
+            if hasattr(obj, "visible_get") and not obj.visible_get(view_layer=view_layer):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _should_skip_instance(inst, obj_eval) -> bool:
+        # Main evaluated object
+        if _is_render_hidden(obj_eval):
+            return True
+
+        # Source object for GN/particle/collection instances
+        src = getattr(inst, "instance_object", None)
+        if src is not None and _is_render_hidden(src):
+            return True
+
+        # Instancer parent (sometimes the one you toggled)
+        parent = getattr(inst, "parent", None)
+        if parent is not None and _is_render_hidden(parent):
+            return True
+
+        return False
+
     for inst in dg.object_instances:
         o = inst.object.evaluated_get(dg)
         if o.type != 'MESH' or o.hide_render: continue
@@ -726,6 +789,83 @@ def _reproj_sanity_check(scene, cam_obj, *, samples=300):
     for ssum,uB,vB,uC,vC in worst[:5]:
         print(f"   worst Δ≈{ssum:.2f}px  Blender=({uB:.1f},{vB:.1f})  Ours=({uC:.1f},{vC:.1f})")
     return rmse, su/n, sv/n
+
+# --- RS-Studio: render visibility helpers (object + collection 'disable render') ---
+# These are used by the Surface-sampled point cloud exporter so that turning off
+# the Outliner camera icon (object or collection) also removes that geometry from
+# the exported fused_points.ply / points3D.
+
+def _rs_collect_layer_collection_hidden(view_layer):
+    """Return {Collection -> hidden_for_render_bool} for the given ViewLayer."""
+    col_hidden = {}
+    root = getattr(view_layer, 'layer_collection', None)
+    if root is None:
+        return col_hidden
+
+    def walk(lc, parent_hidden=False):
+        col = getattr(lc, 'collection', None)
+        # Some Blender versions store render-restriction on LayerCollection (lc.hide_render),
+        # others on Collection (lc.collection.hide_render). We check both.
+        lc_exclude = bool(getattr(lc, 'exclude', False))
+        lc_hide_render = bool(getattr(lc, 'hide_render', False))
+        col_hide_render = bool(getattr(col, 'hide_render', False)) if col is not None else False
+        hidden = parent_hidden or lc_exclude or lc_hide_render or col_hide_render
+        if col is not None:
+            col_hidden[col] = hidden
+        for ch in getattr(lc, 'children', []):
+            walk(ch, hidden)
+
+    try:
+        walk(root, False)
+    except Exception:
+        # Fail-open (treat collections as visible) so we don't accidentally export an empty cloud.
+        return {}
+    return col_hidden
+
+
+def _rs_hidden_by_layer_collections(obj, col_hidden):
+    """True if the object is effectively hidden by view-layer collection settings.
+
+    We treat collections missing from col_hidden as VISIBLE (fail-open).
+    """
+    cols = getattr(obj, 'users_collection', None) or []
+    if not cols:
+        return False
+    # Visible if ANY of its collections is not hidden.
+    for c in cols:
+        if not col_hidden.get(c, False):
+            return False
+    return True
+
+
+def _rs_is_render_hidden(obj, *, col_hidden=None):
+    """Return True if this object is hidden for render by object/collection toggles."""
+    if obj is None:
+        return False
+    if getattr(obj, 'hide_render', False):
+        return True
+    orig = getattr(obj, 'original', None)
+    if orig is not None and getattr(orig, 'hide_render', False):
+        return True
+    if col_hidden is not None:
+        if _rs_hidden_by_layer_collections(obj, col_hidden):
+            return True
+        if orig is not None and _rs_hidden_by_layer_collections(orig, col_hidden):
+            return True
+    return False
+
+
+def _rs_should_skip_instance(inst, obj_eval, *, col_hidden=None):
+    """Return True if this depsgraph instance should be skipped for surface sampling."""
+    if _rs_is_render_hidden(obj_eval, col_hidden=col_hidden):
+        return True
+    parent = getattr(inst, 'parent', None)
+    if parent is not None and _rs_is_render_hidden(parent, col_hidden=col_hidden):
+        return True
+    # NOTE: We intentionally do NOT check inst.instance_object.hide_render here.
+    # Blender can still render instances whose source object has the camera icon disabled.
+    return False
+
 
 
 class Colmap3DGSDepthWriter(ColmapPoseWriter):
@@ -1339,6 +1479,8 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
             bmax_cv = mu.Vector(( 1e9,  1e9,  1e9))
         # depsgraph & evaluated scene for accurate geometry + ray cast
         dg = bpy.context.evaluated_depsgraph_get()
+        view_layer = bpy.context.view_layer
+        _col_hidden = _rs_collect_layer_collection_hidden(view_layer)
         # 1) collect triangles (world space) grouped by *object* (layered sampling)
         # bucket schema: { "name": str, "tris": list[dict], "area": float, "cdf": np.ndarray }
         buckets: list[dict] = []
@@ -1433,7 +1575,7 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
         # Traverse *evaluated instances* so collection/geometry instances are included.
         for inst in dg.object_instances:
             obj_eval = inst.object.evaluated_get(dg)
-            if obj_eval.type != 'MESH' or obj_eval.hide_render:
+            if obj_eval.type != 'MESH' or _rs_should_skip_instance(inst, obj_eval, col_hidden=_col_hidden):
                 continue
 
             me = obj_eval.to_mesh()
