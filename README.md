@@ -1,6 +1,6 @@
 # RS Studio (RealSynth Dataset Studio) — Blender Add-on
 
-RS Studio is a Blender add-on for dataset generation and camera virtualization.
+RS Studio is a **Blender add-on for dataset generation and camera virtualization**.
 It supports importing or generating multi-view camera rigs, rendering multi-frame datasets, and exporting data in formats commonly used by NeRF / Instant-NGP / COLMAP / 3D Gaussian Splatting (3DGS) pipelines, **including COLMAP format 3DGS datasets with mesh-sampled ground-truth point clouds**.
 
 > UI entry: **3D Viewport → Sidebar (N-panel) → RS Studio**
