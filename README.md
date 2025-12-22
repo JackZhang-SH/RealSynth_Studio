@@ -4,6 +4,7 @@ RS Studio is a Blender add-on for **dataset generation and camera virtualization
 
 > UI entry: **3D Viewport → Sidebar (N-panel) → RS Studio**
 
+![RS Studio UI](assets\3.png) 
 ---
 
 ## Table of Contents
