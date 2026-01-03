@@ -243,7 +243,7 @@ class RS_PT_MainPanel(bpy.types.Panel):
                              icon='INFO')
                 
 class RS_PT_CameraTrack(bpy.types.Panel):
-    bl_label = "Camera Track → 3DGS"
+    bl_label = "Camera Track Export"
     bl_idname = "RS_PT_camera_track"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
