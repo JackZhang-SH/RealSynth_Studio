@@ -207,21 +207,7 @@ Tip: If you want perfectly repeatable renders, keep lighting settings fixed acro
 
 ---
 
-#### 3) Scan Post-Import
-Tools for cleaning up scan/asset imports (photogrammetry meshes, stadium scans, etc.) into predictable collections.
-
-- **Fix Scale**
-  - Intended to apply transforms so imported assets have consistent scale.
-- **Ensure Material**
-  - Intended to create/ensure a basic Principled BSDF material setup.
-- **Organize Scan**
-  - Moves selected objects into `Scans/Models` collections and runs cleanup steps.
-
-> Note: Depending on your current implementation, some cleanup steps may run unconditionally; the checkboxes are UI toggles prepared for future conditional behavior.
-
----
-
-#### 4) Camera Generator
+#### 3) Camera Generator
 Generates a set of RS Studio cameras around a target point.
 
 - **Images Per Frame**
@@ -252,7 +238,7 @@ Generates a set of RS Studio cameras around a target point.
 
 ---
 
-#### 5) Stadium Layout
+#### 4) Stadium Layout
 Generates stadium-style rigs with stable naming and indexing.
 
 - **Pitch Length / Pitch Width (meters)**
@@ -281,7 +267,7 @@ Generates stadium-style rigs with stable naming and indexing.
 
 ---
 
-#### 6) Dataset Generation
+#### 5) Dataset Generation
 Renders and exports datasets across a frame range.
 
 - **Output Directory**
