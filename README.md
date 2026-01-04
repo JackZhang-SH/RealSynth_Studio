@@ -60,6 +60,76 @@ It supports importing or generating multi-view camera rigs, rendering multi-fram
    - Linux: `~/.config/blender/<version>/scripts/addons/`
 3. Enable the add-on in Blender.
 
+
+## Optional: Install `pysolar` (for Sun-Position Outdoor Lighting)
+
+RS Studio uses the `pysolar` Python package to compute physically-based sun direction from date/time/location.
+This is optional — you only need it if you want the **Sun-Position Outdoor Lighting** feature.
+
+### 1) Find Blender’s bundled Python
+
+Blender ships with its own Python interpreter. You must install `pysolar` into **that** Python (not your system Python).
+
+Typical locations:
+
+- **Windows**
+  - `C:\Program Files\Blender Foundation\Blender <version>\<version>\python\bin\python.exe`
+- **macOS**
+  - `/Applications/Blender.app/Contents/Resources/<version>/python/bin/python3`
+- **Linux**
+  - `<blender_install_dir>/<version>/python/bin/python3`
+
+> Tip: If you cannot find it, search your Blender installation folder for `python.exe` (Windows) or `python3` (macOS/Linux).
+
+---
+
+### 2) Install via pip
+
+#### Windows (PowerShell)
+
+```powershell
+$blenderPy = "C:\Program Files\Blender Foundation\Blender 4.0\4.0\python\bin\python.exe"
+& $blenderPy -m pip install --upgrade pip
+& $blenderPy -m pip install pysolar
+```
+
+#### macOS / Linux (Terminal)
+
+```bash
+BLENDER_PY="/path/to/blender/<version>/python/bin/python3"
+"$BLENDER_PY" -m pip install --upgrade pip
+"$BLENDER_PY" -m pip install pysolar
+```
+
+---
+
+### 3) Verify in Blender
+
+Restart Blender, then open **Scripting → Python Console** and run:
+
+```python
+import pysolar
+print("pysolar OK")
+```
+
+If you see `pysolar OK`, you’re done.
+
+---
+
+### Troubleshooting
+
+- **`pip` not found**
+  - Try: `"$BLENDER_PY" -m ensurepip --upgrade`
+  - Then rerun the install commands.
+
+- **Permission error (macOS/Linux)**
+  - Use `--user`:
+    - `"$BLENDER_PY" -m pip install --user pysolar`
+
+- **Wrong Python**
+  - If `import pysolar` works in your system Python but not inside Blender, it means you installed it into the wrong interpreter.
+    Make sure you are using Blender’s bundled Python path above.
+
 ---
 
 ## Quick Start
