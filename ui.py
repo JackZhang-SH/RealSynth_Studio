@@ -83,12 +83,12 @@ class RS_PT_MainPanel(bpy.types.Panel):
         light.operator("rs.apply_lighting", icon='CHECKMARK')
         light.operator("rs.clear_lighting", icon='TRASH')
         # ─────────────── Post-Import Organiser ─────────────── #
-        org = layout.box()
-        org.label(text="Scan Post-Import", icon='FILE_REFRESH')
-        row = org.row(align=True)
-        row.operator("rs.organize_scan", icon='FILE_REFRESH')
-        row.prop(s, "scan_fix_scale", text="Scale ↔ 1 m")
-        row.prop(s, "scan_fix_material", text="Fix Material")
+        # org = layout.box()
+        # org.label(text="Scan Post-Import", icon='FILE_REFRESH')
+        # row = org.row(align=True)
+        # row.operator("rs.organize_scan", icon='FILE_REFRESH')
+        # row.prop(s, "scan_fix_scale", text="Scale ↔ 1 m")
+        # row.prop(s, "scan_fix_material", text="Fix Material")
         # ─────────────── Camera Rig ─────────────── #
 
 
