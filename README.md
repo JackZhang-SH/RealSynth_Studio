@@ -1,6 +1,6 @@
 # RS Studio (RealSynth Dataset Studio) — Blender Add-on
 
-## 🎬Feature Overview & Usage Guide
+> 🎥 **Watch the demo video (feature overview & usage tutorial)**
 [![Watch the video](https://img.youtube.com/vi/otr5RFAeRmw/maxresdefault.jpg)](https://youtu.be/otr5RFAeRmw)
 
 RS Studio is a **Blender add-on for dataset generation and camera virtualization**.
