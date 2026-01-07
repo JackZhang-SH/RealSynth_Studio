@@ -3,13 +3,37 @@
 > 🎥 **Watch the demo video (feature overview & usage tutorial)**
 [![Watch the video](https://img.youtube.com/vi/JmlZSmdW96Q/maxresdefault.jpg)](https://youtu.be/JmlZSmdW96Q)
 
-RS Studio is a **Blender add-on for dataset generation and camera virtualization**.
-It supports importing or generating multi-view camera rigs, rendering multi-frame datasets, and exporting data in formats commonly used by NeRF / Instant-NGP / COLMAP / 3D Gaussian Splatting (3DGS) pipelines, **including COLMAP format 3DGS datasets with mesh-sampled ground-truth point clouds**.
+RS Studio is a **Blender add-on for dataset generation and camera virtualization**.  
+It supports importing or generating multi-view camera rigs, rendering multi-frame datasets, and exporting data in formats commonly used by **COLMAP / NeRF / Instant-NGP / 3D Gaussian Splatting (3DGS)** pipelines, including **COLMAP-format 3DGS datasets with mesh-sampled ground-truth point clouds**.
+
+If you're interested in the research context behind RS Studio—especially **TACV** and its 3DGS variant—the following repos provide the method details and training pipelines:
+
+## 🔗 Related Repositories (TACV Ecosystem)
+
+TACV (Time-Archival Camera Virtualization) is designed for dynamic sports scenes (e.g., stadium events) where camera parameters can be pre-calibrated and remain consistent.  
+Instead of treating the entire dynamic sequence as a single reconstruction problem, TACV organizes the scene into a time-indexed set of “archival” multi-view snapshots, enabling **per-time-step 3D reconstruction** and consistent evaluation across time.
+
+RS Studio aligns naturally with TACV: Blender cameras are explicitly defined with known intrinsics/extrinsics, matching TACV’s pre-calibrated stadium-rig assumption. RS Studio focuses on generating and exporting the resulting per-frame datasets, which can then be used for downstream training and evaluation.
+
+- **TACV Method (origin of TACV export in RS Studio)**
+  - **Time-Archival Camera Virtualization for Visual Performance and Sports (TACV)**
+  - Repo: [Time-Archival-Camera-Virtualization-for-Visual-Performance-and-Sports](https://github.com/JackZhang-SH/Time-Archival-Camera-Virtualization-for-Visual-Performance-and-Sports)
+  - What it is: the core TACV method and the reference definition/usage of the TACV dataset format.
+
+- **TACV 3DGS Variant (recommended to pair with RS Studio exports)**
+  - **Time Archival 3DGS**
+  - Repo: [TimeArchival3DGS](https://github.com/JackZhang-SH/TimeArchival3DGS)
+  - Best match with RS Studio: use **COLMAP + 3DGS (Surface Points)** export in RS Studio to generate
+    COLMAP-style frames + `fused_points.ply`, a convenient setup for 3DGS initialization and training.
+
+Below is a quick UI pointer and screenshot.
 
 > UI entry: **3D Viewport → Sidebar (N-panel) → RS Studio**
 
-![RS Studio UI](./assets/3.png) 
+![RS Studio UI](./assets/3.png)
+
 ---
+
 
 ## Table of Contents
 - [Key Features](#key-features)
