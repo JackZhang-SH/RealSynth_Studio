@@ -1,4 +1,4 @@
-# ui.py – adds “Import Cameras” section above Camera Rig
+# ui.py
 from __future__ import annotations
 
 import bpy
@@ -56,7 +56,6 @@ class RS_PT_MainPanel(bpy.types.Panel):
         light.prop(s2, "weather")
 
         # weather-specific sliders
-        # Lighting 面板中的天气-相关控件
         if s2.weather == "SUNNY":
             light.prop(s2, "sun_intensity", slider=True)
         elif s2.weather == "RAIN":
@@ -68,16 +67,10 @@ class RS_PT_MainPanel(bpy.types.Panel):
         if s2.location == "OUTDOOR":
             col = light.column(align=True)
             col.use_property_split = True
-
-            # 日期 & 小时（小时带滑条，步长 0.25 h）
             col.prop(s2, "date", text="Date")
             col.prop(s2, "hour", text="Local Time (h)", slider=True)
-
-            # 经纬度两行分开，滑条 ±90 / ±180
             col.prop(s2, "latitude",  text="Latitude (°)",  slider=True)
             col.prop(s2, "longitude", text="Longitude (°)", slider=True)
-
-            # 时区提示
             tz_off = s2.longitude / 15.0
             light.label(text=f"Local TZ ≈ UTC{tz_off:+.1f} h")
         light.operator("rs.apply_lighting", icon='CHECKMARK')

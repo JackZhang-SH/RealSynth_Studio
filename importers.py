@@ -1,4 +1,4 @@
-# importers.py  (放在 addon 根目录或 core 子包)
+# importers.py 
 from __future__ import annotations
 
 import math
@@ -20,22 +20,22 @@ def _apply_intrinsics(
     fx: float, fy: float,
     cx: float, cy: float,
     dist: dict[str, float] | None = None,
-    sensor_width: float = 36.0,          # 常用全幅等效
+    sensor_width: float = 36.0,          
 ):
     """Write (fx, fy, cx, cy) ⟹ Blender camera, **preserving** values loss-lessly."""
     camdat.type = 'PERSP'
-    camdat.sensor_fit = 'HORIZONTAL'          # 锁水平以免 Blender 自动缩放纵向
+    camdat.sensor_fit = 'HORIZONTAL'         
     camdat.sensor_width = sensor_width
-    camdat.lens = fx * sensor_width / w       # 焦距(mm)
+    camdat.lens = fx * sensor_width / w     
 
-    # 校正纵向焦距
+
     camdat.sensor_height = sensor_width * h / w * fx / fy
 
-    # 主点偏移 → shift
-    camdat.shift_x = (cx / w) - 0.5           # +右  -左
-    camdat.shift_y = 0.5 - (cy / h)           # +上  -下（OpenCV⇄Blender）
 
-    # 持久化到自定义属性，便于导出阶段直接读取
+    camdat.shift_x = (cx / w) - 0.5          
+    camdat.shift_y = 0.5 - (cy / h)           
+
+
     camdat["fl_x"], camdat["fl_y"] = fx, fy
     camdat["cx"],  camdat["cy"]    = cx, cy
     if dist:
@@ -44,12 +44,11 @@ def _apply_intrinsics(
 
 # ───────────────────── Base class ───────────────────── #
 class BaseImporter(ABC):
-    """负责把 *某种* 外部相机格式 → Blender 相机"""
 
-    # 子类需重载的枚举名称，用于 UI 下拉框
+
+
     format_name: str
 
-    # ——— 主入口 ——— #
     def __call__(
         self,
         model_dir: Path,
@@ -59,17 +58,13 @@ class BaseImporter(ABC):
         collection: bpy.types.Collection,
         color: Tuple[float, float, float, float],
     ) -> int:
-        """
-        解析并将相机实例化到场景  
-        返回创建的相机数量
-        """
+
         cams = self.parse(model_dir)
         self.instantiate(
             cams, name_prefix, start_index, collection, color
         )
         return len(cams)
 
-    # ——— 子类必须实现 ——— #
     @abstractmethod
     def parse(self, model_dir: Path) -> List[Dict]:
         """读磁盘 -> 返回 [{'R':(4,), 't':(3,), 'w':W, 'h':H, 'fx':, …}, ...]"""
@@ -119,7 +114,6 @@ class BaseImporter(ABC):
             name = f"{name_prefix}_{start_index+idx}_train"
             camdat = bpy.data.cameras.new(name)
 
-            # --- 写入内参 ----------------------------------------------------
             w, h  = info["w"],  info["h"]
             fx,fy = info["fx"], info["fy"]
             cx    = info.get("cx", w*0.5)
@@ -137,7 +131,6 @@ class BaseImporter(ABC):
             _ensure_marker(obj, color, collection)
 
 
-# ───────────────────── COLMAP 实现 ───────────────────── #
 class ColmapImporter(BaseImporter):
     format_name = "COLMAP"
 
@@ -155,7 +148,7 @@ class ColmapImporter(BaseImporter):
                 elif model == "SIMPLE_PINHOLE":
                     fx = fy = float(t[4])
                     cx, cy = map(float, t[5:7])
-                else:  # 粗放兜底
+                else:  
                     fx, fy = map(float, t[4:6])
                     cx = cy = 0.5
                 cams[cid] = dict(w=w, h=h, fx=fx, fy=fy, cx=cx, cy=cy)
@@ -179,10 +172,10 @@ class ColmapImporter(BaseImporter):
         for raw in imgs_txt.read_text().splitlines():
             raw = raw.strip()
             if not raw or raw.startswith("#"):
-                continue                     # 跳过空行 / 注释
+                continue                     
             t = raw.split()
-            if len(t) < 10:                 # 第二行 (x y X Y id ...) 或异常行
-               continue                    # 直接忽略
+            if len(t) < 10:                 
+               continue                    
             q = tuple(map(float, t[1:5]))  # w,x,y,z
             trans = tuple(map(float, t[5:8]))
             cam_id = int(t[8])
@@ -202,7 +195,6 @@ def _matrix_from_list(m):
 class NGPImporter(BaseImporter):
     format_name = "NGP"
 
-    # ---------- 解析 ---------- #
     def parse(self, model_dir: Path):
         import json
         tf_files = list(model_dir.rglob("transforms*.json"))
@@ -214,7 +206,7 @@ class NGPImporter(BaseImporter):
             data = json.loads(f.read_text())
             w, h   = data["w"],   data["h"]
             fx, fy = data["fl_x"], data["fl_y"]
-            cx     = data.get("cx", w * 0.5)          # ≤ v4.4 作者输出里就有 cx/cy
+            cx     = data.get("cx", w * 0.5)          
             cy     = data.get("cy", h * 0.5)
 
             split  = ("test" if "test" in f.stem else
@@ -228,7 +220,7 @@ class NGPImporter(BaseImporter):
                 ))
         return cams
 
-    # ---------- 实例化 ---------- #
+
     def instantiate(self, cams, name_prefix, start_index, *_):
         from .operators import _ensure_collections, _ensure_marker, SPLIT_COLORS
         subcols = _ensure_collections()
@@ -263,7 +255,6 @@ class NGPImporter(BaseImporter):
 class TACVImporter(BaseImporter):
     format_name = "TACV"
 
-    # ---------- 解析 ---------- #
     def parse(self, model_dir: Path):
         import json
         cams = []
@@ -290,8 +281,7 @@ class TACVImporter(BaseImporter):
             raise FileNotFoundError("No transforms*.json found")
         return cams
 
-    # ---------- 实例化 ---------- #
-    instantiate = NGPImporter.instantiate      # 逻辑完全一致
+    instantiate = NGPImporter.instantiate      
 
 # ───────────────────── NeRF Synthetic ───────────────────── #
 class NeRFSynthImporter(BaseImporter):
@@ -349,7 +339,6 @@ class CMUPanopticImporter(BaseImporter):
         import json
         from mathutils import Matrix, Vector
 
-        # --- 找到 json ---
         if model_dir.is_file():
             json_path = model_dir
         else:
@@ -386,10 +375,10 @@ class CMUPanopticImporter(BaseImporter):
 IMPORTER_REGISTRY: Dict[str, BaseImporter] = {}
 
 def _register_importer(cls: type[BaseImporter]):
-    IMPORTER_REGISTRY[cls.format_name] = cls()  # 单例
+    IMPORTER_REGISTRY[cls.format_name] = cls()  
     return cls
 
-# 把 COLMAP 注册进去
+
 _register_importer(ColmapImporter)
 _register_importer(NeRFSynthImporter)
 _register_importer(NGPImporter)

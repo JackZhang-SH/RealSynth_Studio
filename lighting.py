@@ -24,8 +24,8 @@ from mathutils import Vector
 import bmesh
 import random
 
-# ===== 1. 顶部区域：常量 & collection helper =============================
-_LIGHTS_COLLECTION = "RS_Lighting"          # <- NEW
+# ===== collection helper =============================
+_LIGHTS_COLLECTION = "RS_Lighting"       
 
 def _ensure_lights_collection() -> bpy.types.Collection:
     """Return the dedicated collection that stores every light created by RS-Studio."""
@@ -65,17 +65,17 @@ def _switch_viewport_to_rendered() -> None:
                 space.shading.use_scene_lights = True
                 space.shading.use_scene_world  = True
 # ---- render-engine guard (NEW) ------------------------------------------- #
-from bpy.types import RenderSettings               # 放在文件顶部已有 import 后
+from bpy.types import RenderSettings             
 
 def _ensure_preview_engine(scene: bpy.types.Scene) -> None:
     """
     If the current engine is Workbench, switch to Eevee/Eevee-Next so
-    Rendered 视图能立刻看到灯光。
+    Rendered viewport works correctly.
     """
     if scene.render.engine != 'BLENDER_WORKBENCH':
-        return                                      # 用户本来就用 Eevee/Cycles
+        return                                     
 
-    # 优先用 Eevee-Next；若旧版 Blender 没有，则退回 Eevee
+
     engines = {e.identifier
                for e in RenderSettings.bl_rna.properties["engine"].enum_items}
     scene.render.engine = (
@@ -93,17 +93,17 @@ class RSLightingSettings(bpy.types.PropertyGroup):
         default="OUTDOOR",
     )  # type: ignore
     # ───────── Indoor controls ─────────
-    indoor_key_strength: FloatProperty(      # type: ignore  # 主灯（Key）
+    indoor_key_strength: FloatProperty(      # type: ignore  
         name="Key",
         min=0.0, max=2.0, default=1.0,
         description="Key-light multiplier"
     )
-    indoor_fill_strength: FloatProperty(     # type: ignore  # 补光（Fill）
+    indoor_fill_strength: FloatProperty(     # type: ignore 
         name="Fill",
         min=0.0, max=1.0, default=0.4,
         description="Fill-light multiplier"
     )
-    indoor_rim_strength: FloatProperty(     # type: ignore   # 边缘光 / 背光（Rim）
+    indoor_rim_strength: FloatProperty(     # type: ignore  
         name="Rim",
         min=0.0, max=1.5, default=0.6,
         description="Rim-light multiplier"
@@ -111,7 +111,7 @@ class RSLightingSettings(bpy.types.PropertyGroup):
     # 2) Weather
     weather: EnumProperty(
         name="Weather",
-        items=[                                   # ⇐ 只剩 3 个选项
+        items=[                                 
             ("SUNNY", "Sunny (Clear Sky)",  ""),
             ("RAIN",  "Rain",                ""),
             ("FOG",   "Fog / Haze",          ""),
@@ -140,11 +140,11 @@ class RSLightingSettings(bpy.types.PropertyGroup):
                              subtype='TIME')                                              # type: ignore
     latitude:  FloatProperty(
         name="Latitude (°)",  default=30.0,
-        min=-90.0, max=90.0            # ⬅️ 新增
+        min=-90.0, max=90.0         
     )  # type: ignore
     longitude: FloatProperty(
         name="Longitude (°)", default=120.0,
-        min=-180.0, max=180.0          # ⬅️ 新增
+        min=-180.0, max=180.0         
     )  # type: ignore
 
 # ----------------------------------------------------------------- Helpers #
@@ -198,7 +198,7 @@ def _clear_world_nodes(world: bpy.types.World) -> None:
 def _alt_az_pysolar(dt_utc, lat, lon):
     """Return altitude & azimuth in *radians* using pysolar"""
     alt_deg = get_altitude(lat, lon, dt_utc)
-    az_deg  = get_azimuth (lat, lon, dt_utc)      # 0 ° = 北，顺时针正
+    az_deg  = get_azimuth (lat, lon, dt_utc)     
     return math.radians(alt_deg), math.radians(az_deg)
 
 
@@ -232,32 +232,31 @@ def _calc_sun_direction(date_str: str, hour_f: float,
     Returns (dir_vector, altitude_rad).
     dir_vector == None  →  sun below horizon.
     """
-    # ---------- build local datetime then convert to UTC ----------
-    # ① 解析本地日期时间 --------------------------------------------------
+    # ---------- build local datetime then convert to UTC -------------
     h = int(hour_f)
     m = int((hour_f - h) * 60)
     s = int(round(((hour_f - h) * 60 - m) * 60))
 
-    # → 本地时区 offset = 经度(°) × 4 min
+
     offset_min   = int(round(lon_deg * 4))
     tz_local     = _dt.timezone(_dt.timedelta(minutes=offset_min))
     dt_local     = _dt.datetime.strptime(date_str, "%Y-%m-%d").replace(
         hour=h, minute=m, second=s, tzinfo=tz_local)
 
-    # ② 转成 UTC（带 tzinfo）---------------------------------------------
+
     dt_utc = dt_local.astimezone(_dt.timezone.utc)
 
-    # ③ 计算高度角 / 方位角 ------------------------------------------------
+
     if _HAS_PYSOLAR:
         alt, az = _alt_az_pysolar(dt_utc, lat_deg, lon_deg)
     else:
         alt, az = _alt_az_noaa  (dt_utc, lat_deg, lon_deg)
 
-    # 夜晚：直接返回 None
+
     if alt <= math.radians(-0.5):
         return None, alt
 
-    # 转为 Blender 向量 (+X = 东, +Y = 北, +Z = 上)
+
     x = math.cos(alt) * math.sin(az)
     y = math.cos(alt) * math.cos(az)
     z = math.sin(alt)
@@ -271,14 +270,14 @@ def _ensure_collection(name: str) -> bpy.types.Collection:
         bpy.context.scene.collection.children.link(col)
     return col
 # -------------------------- update _setup_sun ------------------------------
-# ────────── ② _setup_sun：完全根据 sun_intensity 调节亮度 ──────────
+
 def _setup_sun(scene: bpy.types.Scene, cfg: RSLightingSettings):
     sun = _ensure_light("RS_Sun", "SUN")
     dir_vec, alt = _calc_sun_direction(
         cfg.date, cfg.hour, cfg.latitude, cfg.longitude
     )
 
-    if dir_vec is None:                       # 夜晚
+    if dir_vec is None:                       
         sun.hide_render = sun.hide_viewport = True
         sun.data.energy = 0.0
         return
@@ -292,7 +291,7 @@ def _setup_sun(scene: bpy.types.Scene, cfg: RSLightingSettings):
     scale       = cfg.sun_intensity ** gamma
     sun.data.energy = base_energy * scale
 
-    if cfg.weather == "RAIN":                        # 雨天再做全局衰减
+    if cfg.weather == "RAIN":                       
         sun.data.energy *= (1.0 - 0.8 * cfg.rain_intensity)
 
     sun.data.angle = math.radians(0.53)
@@ -345,52 +344,44 @@ def _aim_at(obj: bpy.types.Object, target: Vector) -> None:
     obj.rotation_euler = direction.to_track_quat('-Z', 'Y').to_euler()
 # ──────────────────────────────────────────────────────────────
 def _setup_indoor(scene: bpy.types.Scene, cfg: RSLightingSettings):
-    """
-    Studio-like 3-point rig  （Key / Fill / Rim）＋ 低强度环境光
-    ───────────────────────────────────────────────────────────
-        RS_In_Key      : AREA，主光，从左前上方 45° 打向主体
-        RS_In_Fill     : AREA，补光，右侧，亮度较低、偏冷
-        RS_In_Rim      : SPOT，轮廓光，背后高处，制造边缘高光
-    用户可用三个 slider 调节各自能量倍率。
-    """
-    # 1) 彻底清除户外灯具与天空
+
     for n in ("RS_Sun", "RS_In_AreaCeiling", "RS_In_PointFill"):
         _remove_light(n)
     _clear_sky(scene)
     _clear_rain(scene)
     _clear_fog(scene)
     target = Vector((0.0, 0.0, 0.0))
-    # 2) 柔和灰背景（营造室内环境光）
+
     world = _ensure_world(scene)
     _clear_world_nodes(world)
     nt = world.node_tree
     bg = nt.nodes.new("ShaderNodeBackground")
     bg.inputs["Color"].default_value = (0.04, 0.04, 0.04, 1.0)
-    bg.inputs["Strength"].default_value = 0.8     # 环境强度
+    bg.inputs["Strength"].default_value = 0.8    
     out = nt.nodes.new("ShaderNodeOutputWorld")
     nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
 
-    # ───────── Key (主光) ─────────
+    # ───────── Key ─────────
     key = _ensure_light("RS_In_Key", "AREA")
     key.data.shape = 'RECTANGLE'
     key.data.size  = 2.5
     key.data.size_y = 3.5
     key.location = (-4.0, -3.0, 3.0)
     _aim_at(key, target)  
-    key.data.color = (1.0, 0.92, 0.88)           # 略暖
+    key.data.color = (1.0, 0.92, 0.88)          
     key.data.energy = 600.0 * cfg.indoor_key_strength
 
-    # ───────── Fill (补光) ─────────
+    # ───────── Fill  ─────────
     fill = _ensure_light("RS_In_Fill", "AREA")
     fill.data.shape = 'RECTANGLE'
     fill.data.size = 2.0
     fill.data.size_y = 2.0
     fill.location = (3.0, -2.5, 2.2)
     _aim_at(fill, target)  
-    fill.data.color = (0.85, 0.90, 1.0)          # 略冷
+    fill.data.color = (0.85, 0.90, 1.0)          
     fill.data.energy = 300.0 * cfg.indoor_fill_strength
 
-    # ───────── Rim / Back (轮廓光) ─────────
+    # ───────── Rim / Back  ─────────
     rim = _ensure_light("RS_In_Rim", "SPOT")
     rim.location = (2.5, 3.5, 3.5)
     _aim_at(rim, target)  
@@ -538,7 +529,6 @@ def _setup_rain(scene, intensity: float):
         drop.hide_viewport = True           # still invisible in viewport
 
     else:
-        # 只有在未链接时才 link，避免 “already in collection” 错误
         if col not in drop.users_collection:
             col.objects.link(drop)
 
@@ -611,23 +601,20 @@ def _setup_rain(scene, intensity: float):
 
 
 # === Dispatcher – apply() ==================================================
-# ────────── ③ apply()：根据天气决定天空 & 降雨 ──────────
 def apply(scene: bpy.types.Scene, cfg: RSLightingSettings):
     _ensure_lights_collection()   
     _clear_lights_collection()  
     if cfg.location == "INDOOR":
         _setup_indoor(scene, cfg)
         _clear_rain(scene); _clear_fog(scene)
-        return   # 后续户外逻辑直接跳过
+        return   
     if cfg.location == "OUTDOOR":
-        # SUNNY → 纯晴空；RAIN → 预设厚云；FOG 单独控制雾
         sky_cloud = 0.0 if cfg.weather == "SUNNY" else 0.9
         _setup_sky(scene, sky_cloud)
         _setup_sun(scene, cfg)
     else:
         _setup_indoor(scene)
 
-    # 其他天气效应保持原状
     if cfg.weather == "RAIN":
         _setup_rain(scene, cfg.rain_intensity)
     else:
@@ -647,7 +634,6 @@ class RS_OT_ClearLighting(bpy.types.Operator):
     def execute(self, ctx):
         scene = ctx.scene
 
-        # 1) 删除专用 collection 及其对象
         col = bpy.data.collections.get(_LIGHTS_COLLECTION)
         if col:
             for obj in list(col.objects):
@@ -658,15 +644,14 @@ class RS_OT_ClearLighting(bpy.types.Operator):
                     parent.children.unlink(col)
             bpy.data.collections.remove(col)
 
-        # 2) 兜底：清掉散落在外的 RS_ 前缀灯光
         for obj in list(bpy.data.objects):
             if obj.type == 'LIGHT' and obj.name.startswith("RS_"):
                 bpy.data.objects.remove(obj, do_unlink=True)
 
-        # 3) 清雨/雾粒子与天空节点
+
         _clear_rain(scene)
         _clear_fog(scene)
-        _clear_sky(scene)                      # → 中性灰背景
+        _clear_sky(scene)                     
 
         self.report({'INFO'}, "RS-Studio lighting cleared")
         return {'FINISHED'}

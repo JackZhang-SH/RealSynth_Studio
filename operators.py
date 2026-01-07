@@ -1,23 +1,4 @@
 # operators.py
-"""
-Adds coloured mesh markers (sphere / torus / cone) to every RS-Studio camera so that
-* split (train / valid / test)             → sphere colour
-* camera-quality score  (good / warn / bad) → torus colour (hidden until evaluated)
-* extra binary flag (e.g. occlusion)       → cone colour (hidden until flagged)
-
-Mesh markers are hidden from final rendering but always visible in any viewport
-shading because they rely on Object colour, not Overlay icon colours.
-
-Palette (Okabe-Ito, colour-blind safe)
--------------------------------------
-train  : #0072B2  → (0.00, 0.45, 0.70, 1.0)
-valid  : #E69F00  → (0.90, 0.62, 0.00, 1.0)
-test   : #D55E00  → (0.84, 0.37, 0.00, 1.0)
-GOOD   : #009E73  → (0.00, 0.62, 0.45, 0.8)
-WARN   : #F0E442  → (0.94, 0.89, 0.26, 0.8)
-BAD    : #CC79A7  → (0.80, 0.47, 0.65, 0.8)
-FLAG   : #CC79A7  → same as BAD
-"""
 
 from __future__ import annotations
 
@@ -99,7 +80,7 @@ def _get_marker(cam: bpy.types.Object) -> Optional[bpy.types.Object]:
 # ---------------------------------------------------------------------------
 import bmesh
 
-_SHARED_MESH_NAME = "RS_marker_mesh"      # 单例网格，所有小球共用
+_SHARED_MESH_NAME = "RS_marker_mesh"      
 def _get_shared_marker_mesh() -> bpy.types.Mesh:
     """Return a small icosphere mesh (shared by all markers)."""
     mesh = bpy.data.meshes.get(_SHARED_MESH_NAME)
@@ -140,7 +121,6 @@ def _ensure_marker(
         collection.objects.link(marker)
         marker.parent = cam
 
-    # ── 无论新建/已有，都同步到相机位姿 ────────────────────────
     marker.matrix_parent_inverse = cam.matrix_world.inverted()
     marker.matrix_world          = cam.matrix_world
     marker.scale = (1.0, 1.0, 1.0)
@@ -178,18 +158,18 @@ def _force_object_color_shading() -> None:
                 for space in area.spaces:
                     if space.type == 'VIEW_3D':
                         space.shading.color_type = 'OBJECT'
-# settings 枚举动态生成
+
 def _import_items(self, _context):
     return [(k, k, "") for k in IMPORTER_REGISTRY.keys()]
 
 # ─────────────────────── Scene-level settings ───────────────────── #
 class RSDatasetSettings(bpy.types.PropertyGroup):
     # ---------- camera generation ----------
-    images_per_frame: bpy.props.IntProperty(          # 生成的相机数量
+    images_per_frame: bpy.props.IntProperty(          
         name="Number of Cameras", min=1, default=60
     )  # type: ignore
 
-    sampling_strategy: bpy.props.EnumProperty(        # 采样方法
+    sampling_strategy: bpy.props.EnumProperty(        
         name="Sampling Method",
         items=[
             ("HEMI",   "Fibonacci (Upper-Hemisphere)", ""),
@@ -199,11 +179,11 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         default="HEMI",
     )  # type: ignore
 
-    radius: bpy.props.FloatProperty(                  # 球面半径
+    radius: bpy.props.FloatProperty(                  
         name="Sampling Radius", min=0.1, default=10.0
     )  # type: ignore
 
-    target_point: bpy.props.FloatVectorProperty(      # 视点
+    target_point: bpy.props.FloatVectorProperty(      
         name="Look-at Point", subtype="TRANSLATION", default=(0.0, 0.0, 0.0)
     )  # type: ignore
     camera_source: bpy.props.EnumProperty(
@@ -707,7 +687,6 @@ class RS_OT_BuildCameraTrack(bpy.types.Operator):
         def _look_at(obj, target_pos: Vector):
             obj.rotation_euler = (target_pos - obj.location).to_track_quat("-Z", "Y").to_euler()
 
-        # 清掉旧关键帧（只清当前相机的 loc/rot）
         cam_obj.animation_data_clear()
 
         if mode == "ORBIT":
@@ -1123,7 +1102,6 @@ class RS_OT_GenerateDataset(bpy.types.Operator):
                 done, total = next(self._iterator)
             except StopIteration:
                 self._finish(wm, s, cancelled=False)
-                # ⬇️ 新增：强制刷新当前区域，立刻让进度条消失
                 context.area.tag_redraw()
 
                 self.report({"INFO"}, "Dataset generation finished ✔")
@@ -1148,7 +1126,6 @@ class RS_OT_GenerateDataset(bpy.types.Operator):
         settings.is_running = False
         settings.progress = 0.0 if cancelled else 1.0
         _active_generator = None
-        # ⬇️ 新增：刷新所有 3D-View，让 N-panel 立即重绘
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
                 area.tag_redraw()

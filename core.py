@@ -1,27 +1,6 @@
 # core.py
 """
 Core implementation: multi‑camera dataset generator for Blender.
-
-Key classes
------------
-SamplingStrategy                – abstract camera‑position sampler
-FibonacciSphereSampling         – default uniform sphere sampling
-CameraRig                       – creates/maintains one camera per sample
-FrameDatasetRenderer            – renders one frame using the rig
-DatasetGenerator                – drives multiple frames incrementally
-
-2025‑05‑30  (multi‑camera refactor)
-----------------------------------
-* Each sample position is represented by **its own** camera object (``camera
-  {id}``) that persists across frames.  This emulates a real‑world rig where
-  many cameras capture simultaneously.
-* The original logic that teleported a single camera has been retired.
-* A future feature may let users pick a subset of cameras (e.g. for a test
-  split).  The design already stores the full ``self.cameras`` list in
-  ``DatasetGenerator`` so filtering can be implemented later without major
-  refactoring.
-
-All identifiers + comments are English‑only per project guidelines.
 """
 from __future__ import annotations
 import shutil
@@ -270,12 +249,9 @@ class DatasetWriter(ABC):
         """
         self.finish()
 
-    # 额外步数（供进度条预估）；渲染张数外的附加步骤写在这里
     @property
     def extra_steps(self) -> int:
         return 0
-
-    # 若子类需要耗时后处理（例如调用 COLMAP），实现为生成器并在其中 yield
     def postprocess_iter(self) -> Iterator[None]:
         if False:
             yield None
@@ -303,7 +279,6 @@ class NGPDatasetWriter(DatasetWriter):
 
     def register_frame(self, cam_obj, rel_path):
         frame = self._scene.frame_current
-        # 把前缀 "frame_{idx}/" 剥掉，保证相对路径正确
         prefix = f"frame_{frame}/"
         local_fp = rel_path[len(prefix):] if rel_path.startswith(prefix) else rel_path
         if not local_fp.startswith("./"):
@@ -422,7 +397,7 @@ class TACVDatasetWriter(DatasetWriter):
     ├── frame_2/
     │   └── …               (same structure)
     """
-    _DIST_KEYS = ("k1", "k2", "p1", "p2")          # 畸变系数可选
+    _DIST_KEYS = ("k1", "k2", "p1", "p2")        
 
     def __init__(self, root_out: Path, cam0) -> None:
         super().__init__(root_out, cam0)
@@ -472,7 +447,6 @@ class TACVDatasetWriter(DatasetWriter):
         (self._test if split=="test" else self._train)\
             .setdefault(frame, []).append(item)
 
-    # 写文件：一个 frame 一对 transforms*.json ------------------------------- #
     def finish(self):
         for frame in set(self._train) | set(self._test):
             frame_dir = self.root / f"frame_{frame}"
@@ -505,7 +479,6 @@ class ColmapPoseWriter(DatasetWriter):
         self._seq_per_frame: dict[int, int] = {}            # frame → running idx
         self._frames: dict[int, list[tuple[bpy.types.Object, Path]]] = {}
 
-        # 解析场景分辨率一次即可
         scene = bpy.context.scene
         scale = scene.render.resolution_percentage / 100.0
         self._width  = int(scene.render.resolution_x * scale)
@@ -637,16 +610,15 @@ class ColmapPoseWriter(DatasetWriter):
             img_lines: list[str] = []
             for img_id, (cam_obj, img_abs) in enumerate(items, start=1):
                 qw,qx,qy,qz, tx,ty,tz = self._blender_to_colmap(cam_obj)
-                # COLMAP 期望相对 images/ 路径，且用正斜杠
                 rel_name = Path(img_abs).name
-                camera_id = img_id         # 1-to-1，对应上面的 cam_id
+                camera_id = img_id        
                 img_lines.append(
                     f"{img_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} "
                     f"{camera_id} {rel_name}\n\n"
                 )
             (sparse0 / "images.txt").write_text("".join(img_lines))
 
-            # -------- 空 points3D.txt 占位，让 model_converter 不报错 ------
+            # -------- points3D.txt : empty placeholder ---------------------
             (sparse0 / "points3D.txt").touch(exist_ok=True)
             # --- Sanity check: compare Blender vs exported K/R/t (1~2 cams) ---
             try:
@@ -1797,16 +1769,12 @@ class Colmap3DGSSurfaceWriter(ColmapPoseWriter):
         s = float(getattr(bpy.context.scene.rs_settings, "scale", 1.0) or 1.0)
         for k, acc in accum.items():
             c = counts[k]
-            # 平均位置（Blender 世界）
             P_bl = mu.Vector((acc[0]/c, acc[1]/c, acc[2]/c))
-            # 平均法线（Blender 世界 → 归一化）
             N_bl = mu.Vector((acc[3]/c, acc[4]/c, acc[5]/c)).normalized()
-            # 坐标与法线都转到 OpenCV 世界
             P_cv = R_cv_from_bl @ P_bl
             N_cv = (R_cv_from_bl @ N_bl).normalized()
             if s != 1.0:
                 P_cv *= s
-            # 颜色
             rr = int(round(acc[6]/c)); gg = int(round(acc[7]/c)); bb = int(round(acc[8]/c))
             out.append((float(P_cv.x), float(P_cv.y), float(P_cv.z),
                         float(N_cv.x), float(N_cv.y), float(N_cv.z),
@@ -2168,7 +2136,6 @@ class CameraRig:
 class DatasetGenerator:
     """Drive multi-camera, multi-frame dataset export via a DatasetWriter."""
 
-    # 新增 export_format 参数
     def __init__(self, *, cameras, start_frame, end_frame,
                  export_fmt: ExportFormat = ExportFormat.NGP):
         if end_frame < start_frame:
@@ -2181,7 +2148,6 @@ class DatasetGenerator:
         self.export_fmt = export_fmt
 
         frame_cnt = self.end - self.start + 1
-        # 初步估计：仅按「渲染张数」计算；真正 total_steps 会在 iter_generate 里
         self.total_images = len(self.cameras) * frame_cnt
 
     # ------------------------------------------------------------------ helpers
@@ -2279,13 +2245,12 @@ class DatasetGenerator:
                 done += 1
                 yield done, total_steps
 
-            # 该帧所有 camera 渲染完毕后，给 writer 一次机会做 per-frame 处理
+
             writer.flush_frame(frame)
 
         # ----------------------------------------------------------------- finish
         writer.finish_all_frames()
 
-        # 如果某些 writer 想把耗时操作拆成多个 step，可以在 postprocess_iter 里 yield
         for _ in writer.postprocess_iter():
             done += 1
             yield done, total_steps
@@ -2293,5 +2258,5 @@ class DatasetGenerator:
         # Restore original frame to avoid side-effects in Blender
         scene.frame_set(prev_frame)
 
-        # 保证最后一次回调是 “已完成”
+
         yield total_steps, total_steps
