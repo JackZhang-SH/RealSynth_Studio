@@ -10,7 +10,8 @@ If you're interested in the research context behind RS Studio—especially **TAC
 
 ## 🔗 Related Repositories (TACV Ecosystem)
 
-TACV (Time-Archival Camera Virtualization) is designed for dynamic sports scenes (e.g., stadium events) where camera parameters can be pre-calibrated and remain consistent.  
+TACV (Time-Archival Camera Virtualization) is designed for dynamic sports scenes (e.g., stadium events) where camera parameters can be pre-calibrated and remain consistent. 
+
 Instead of treating the entire dynamic sequence as a single reconstruction problem, TACV organizes the scene into a time-indexed set of “archival” multi-view snapshots, enabling **per-time-step 3D reconstruction** and consistent evaluation across time.
 
 RS Studio aligns naturally with TACV: Blender cameras are explicitly defined with known intrinsics/extrinsics, matching TACV’s pre-calibrated stadium-rig assumption. RS Studio focuses on generating and exporting the resulting per-frame datasets, which can then be used for downstream training and evaluation.
