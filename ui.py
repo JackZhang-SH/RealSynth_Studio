@@ -99,8 +99,17 @@ class RS_PT_MainPanel(bpy.types.Panel):
 
         else:
             cam_box.prop(s, "radius", text="Sampling Radius")
+            if s.sampling_strategy in {"HEMI", "SPHERE"}:
+                cam_box.prop(s, "orbit_center", text="Sampling Center (x,y,z)")
+                cam_box.prop(s, "lookat_equals_center")
         cam_box.prop(s, "focal_length_mm", text="Focal Length (mm)")
-        cam_box.prop(s, "target_point")
+
+        if s.sampling_strategy in {"HEMI", "SPHERE"} and s.lookat_equals_center:
+            row = cam_box.row()
+            row.enabled = False
+            row.prop(s, "target_point")
+        else:
+            cam_box.prop(s, "target_point")
 
         row = cam_box.row(align=True)
         row.operator("rs.generate_cameras", icon='CAMERA_DATA')

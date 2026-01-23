@@ -183,9 +183,23 @@ class RSDatasetSettings(bpy.types.PropertyGroup):
         name="Sampling Radius", min=0.1, default=10.0
     )  # type: ignore
 
+    orbit_center: bpy.props.FloatVectorProperty(      
+        name="Sampling Center (x,y,z)",
+        description="World-space center around which sphere/hemisphere cameras are placed",
+        size=3, subtype="TRANSLATION",
+        default=(0.0, 0.0, 0.0),
+    )  # type: ignore
+
     target_point: bpy.props.FloatVectorProperty(      
         name="Look-at Point", subtype="TRANSLATION", default=(0.0, 0.0, 0.0)
     )  # type: ignore
+
+    lookat_equals_center: bpy.props.BoolProperty(
+        name="Look-at = Sampling Center",
+        description="If enabled, cameras will point to the Sampling Center when using Hemisphere/Full-Sphere sampling",
+        default=False,
+    )  # type: ignore
+
     camera_source: bpy.props.EnumProperty(
         name="Template",
         items=[
@@ -842,19 +856,24 @@ class RS_OT_GenerateCameras(bpy.types.Operator):
 
         # ------------------------------------------------ sample positions --
         # ------------------------------------------------ sample positions --
+        center = Vector(s.orbit_center)
+
         if s.sampling_strategy == "HEMI":
             positions = FibonacciHemisphereSampling().sample(s.images_per_frame, s.radius)
+            positions = [Vector(p) + center for p in positions]
         elif s.sampling_strategy == "SPHERE":
             positions = FibonacciSphereSampling().sample(s.images_per_frame, s.radius)
+            positions = [Vector(p) + center for p in positions]
 
         else:  # "ELLIPSE"
             Sampler = EllipticalRingSampling(
                 a=s.radius,
                 b=s.ellipse_minor,
-                center=s.ellipse_center,   # NEW
+                center=s.ellipse_center,
             )
             positions = Sampler.sample(s.images_per_frame, s.radius)
-        target = Vector(s.target_point)
+
+        target = Vector(s.orbit_center) if (s.sampling_strategy in {'HEMI', 'SPHERE'} and s.lookat_equals_center) else Vector(s.target_point)
 
         # ------------------------------------------------ idx bookkeeping --
         existing = [
