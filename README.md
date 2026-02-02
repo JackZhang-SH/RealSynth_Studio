@@ -6,26 +6,7 @@
 RS Studio is a **Blender add-on for dataset generation and camera virtualization**.  
 It supports importing or generating multi-view camera rigs, rendering multi-frame datasets, and exporting data in formats commonly used by **COLMAP / NeRF / Instant-NGP / 3D Gaussian Splatting (3DGS)** pipelines, including **COLMAP-format 3DGS datasets with mesh-sampled ground-truth point clouds**.
 
-If you're interested in the research context behind RS Studio—especially **TACV** and its 3DGS variant—the following repos provide the method details and training pipelines:
-
-## 🔗 Related Repositories (TACV Ecosystem)
-
-TACV (Time-Archival Camera Virtualization) is designed for dynamic sports scenes (e.g., stadium events) where camera parameters can be pre-calibrated and remain consistent. 
-
-Instead of treating the entire dynamic sequence as a single reconstruction problem, TACV organizes the scene into a time-indexed set of “archival” multi-view snapshots, enabling **per-time-step 3D reconstruction** and consistent evaluation across time.
-
-RS Studio aligns naturally with TACV: Blender cameras are explicitly defined with known intrinsics/extrinsics, matching TACV’s pre-calibrated stadium-rig assumption. RS Studio focuses on generating and exporting the resulting per-frame datasets, which can then be used for downstream training and evaluation.
-
-- **TACV Method (origin of TACV export in RS Studio)**
-  - **Time-Archival Camera Virtualization for Visual Performance and Sports (TACV)**
-  - Repo: [Time-Archival-Camera-Virtualization-for-Visual-Performance-and-Sports](https://github.com/JackZhang-SH/Time-Archival-Camera-Virtualization-for-Visual-Performance-and-Sports)
-  - What it is: the core TACV method and the reference definition/usage of the TACV dataset format.
-
-- **TACV 3DGS Variant (recommended to pair with RS Studio exports)**
-  - **Time Archival 3DGS**
-  - Repo: [TimeArchival3DGS](https://github.com/JackZhang-SH/TimeArchival3DGS)
-  - Best match with RS Studio: use **COLMAP + 3DGS (Surface Points)** export in RS Studio to generate
-    COLMAP-style frames + `fused_points.ply`, a convenient setup for 3DGS initialization and training.
+If you’re looking for the research context (TACV ecosystem), jump to: **[Research Context](#research-context-optional)**.
 
 Below is a quick UI pointer and screenshot.
 
@@ -34,7 +15,6 @@ Below is a quick UI pointer and screenshot.
 ![RS Studio UI](./assets/3.png)
 
 ---
-
 
 ## Table of Contents
 - [Key Features](#key-features)
@@ -48,6 +28,7 @@ Below is a quick UI pointer and screenshot.
 - [Camera Naming & Splits](#camera-naming--splits)
 - [Development Notes](#development-notes)
 - [Troubleshooting](#troubleshooting)
+- [Research Context](#research-context)
 - [Contributing](#contributing)
 - [License](#license)
 - [Citation](#citation)
@@ -88,33 +69,30 @@ Below is a quick UI pointer and screenshot.
    - Linux: `~/.config/blender/<version>/scripts/addons/`
 3. Enable the add-on in Blender.
 
+---
 
 ## Optional: Install `pysolar` (for Sun-Position Outdoor Lighting)
 
-RS Studio uses the `pysolar` Python package to compute physically-based sun direction from date/time/location.
+RS Studio uses the `pysolar` Python package to compute physically-based sun direction from date/time/location.  
 This is optional — you only need it if you want the **Sun-Position Outdoor Lighting** feature.
 
 ### 1) Find Blender’s bundled Python
-
 Blender ships with its own Python interpreter. You must install `pysolar` into **that** Python (not your system Python).
 
 Typical locations:
 
-- **Windows**
-  - `C:\Program Files\Blender Foundation\Blender <version>\<version>\python\bin\python.exe`
-- **macOS**
-  - `/Applications/Blender.app/Contents/Resources/<version>/python/bin/python3`
-- **Linux**
-  - `<blender_install_dir>/<version>/python/bin/python3`
+- **Windows**  
+  `C:\Program Files\Blender Foundation\Blender <version>\<version>\python\bin\python.exe`
+- **macOS**  
+  `/Applications/Blender.app/Contents/Resources/<version>/python/bin/python3`
+- **Linux**  
+  `<blender_install_dir>/<version>/python/bin/python3`
 
 > Tip: If you cannot find it, search your Blender installation folder for `python.exe` (Windows) or `python3` (macOS/Linux).
-
----
 
 ### 2) Install via pip
 
 #### Windows (PowerShell)
-
 ```powershell
 $blenderPy = "C:\Program Files\Blender Foundation\Blender 4.0\4.0\python\bin\python.exe"
 & $blenderPy -m pip install --upgrade pip
@@ -122,17 +100,13 @@ $blenderPy = "C:\Program Files\Blender Foundation\Blender 4.0\4.0\python\bin\pyt
 ```
 
 #### macOS / Linux (Terminal)
-
 ```bash
 BLENDER_PY="/path/to/blender/<version>/python/bin/python3"
 "$BLENDER_PY" -m pip install --upgrade pip
 "$BLENDER_PY" -m pip install pysolar
 ```
 
----
-
 ### 3) Verify in Blender
-
 Restart Blender, then open **Scripting → Python Console** and run:
 
 ```python
@@ -142,25 +116,25 @@ print("pysolar OK")
 
 If you see `pysolar OK`, you’re done.
 
----
-
 ### Troubleshooting
-
 - **`pip` not found**
   - Try: `"$BLENDER_PY" -m ensurepip --upgrade`
   - Then rerun the install commands.
-
 - **Permission error (macOS/Linux)**
   - Use `--user`:
     - `"$BLENDER_PY" -m pip install --user pysolar`
-
 - **Wrong Python**
-  - If `import pysolar` works in your system Python but not inside Blender, it means you installed it into the wrong interpreter.
+  - If `import pysolar` works in your system Python but not inside Blender, it means you installed it into the wrong interpreter.  
     Make sure you are using Blender’s bundled Python path above.
 
 ---
 
 ## Quick Start
+
+### 0) UI entry
+Open: **3D Viewport → Sidebar (N-panel) → RS Studio**
+
+![RS Studio UI](./assets/3.png)
 
 ### 1) Prepare your scene
 - Open your Blender scene (static or animated).
@@ -168,6 +142,7 @@ If you see `pysolar OK`, you’re done.
 - Set render resolution and engine as desired.
 
 ### 2) Create or import cameras
+
 **Generate cameras**
 - Open **RS Studio** panel.
 - Choose a sampling strategy (HEMI / SPHERE / ELLIPSE).
@@ -386,7 +361,7 @@ Depending on the chosen export mode, RS Studio can produce:
 RS Studio exports **one folder per animation frame**:
 
 ### Instant-NGP (per frame)
-```
+```text
 <output_dir>/
   frame_<F>/
     train/
@@ -397,7 +372,7 @@ RS Studio exports **one folder per animation frame**:
 ```
 
 ### TACV (per frame)
-```
+```text
 <output_dir>/
   frame_<F>/
     train/
@@ -409,7 +384,7 @@ RS Studio exports **one folder per animation frame**:
 ```
 
 ### COLMAP pose-only (per frame)
-```
+```text
 <output_dir>/
   frame_<F>/
     images/
@@ -424,7 +399,7 @@ RS Studio exports **one folder per animation frame**:
 ```
 
 ### COLMAP + 3DGS (Surface Points) (per frame)
-```
+```text
 <output_dir>/
   frame_<F>/
     images/
@@ -440,16 +415,16 @@ Similar to the surface route, but points are reconstructed from depth rendering 
 ## Camera Naming & Splits
 
 ### RS Studio camera naming
-- Generated cameras follow:
-  - `RS_Studio_<id>_train`
-  - `RS_Studio_<id>_valid`
-  - `RS_Studio_<id>_test`
+Generated cameras follow:
+- `RS_Studio_<id>_train`
+- `RS_Studio_<id>_valid`
+- `RS_Studio_<id>_test`
 
 ### Splits
-- Use **Set Split (Train / Valid / Test)** to:
-  - rename selected cameras with the split suffix
-  - move them into split collections
-  - colorize markers for readability
+Use **Set Split (Train / Valid / Test)** to:
+- rename selected cameras with the split suffix
+- move them into split collections
+- colorize markers for readability
 
 ---
 
@@ -474,6 +449,18 @@ Typical workflow:
 
 ---
 
+## Research Context
+
+RS Studio is part of the TACV ecosystem (**paper under revision at CVIU; preprint not public yet**).  
+RS Studio focuses on dataset generation/export; TACV/TA-3DGS provide downstream reconstruction and evaluation.
+
+- **TACV (method + dataset format definition)**  
+  Repo: https://github.com/JackZhang-SH/Time-Archival-Camera-Virtualization-for-Visual-Performance-and-Sports
+- **TA-3DGS (3DGS training/eval pipeline aligned with TACV)**  
+  Repo: https://github.com/JackZhang-SH/TimeArchival3DGS
+
+---
+
 ## Contributing
 Issues and PRs are welcome. If you add new export formats or camera rigs, please also update:
 - `operators.py` (properties + operators)
@@ -483,8 +470,9 @@ Issues and PRs are welcome. If you add new export formats or camera rigs, please
 ---
 
 ## License
-Choose a license before publishing (MIT / Apache-2.0 / GPL-3.0 are common for Blender add-ons).
-Once chosen, add a `LICENSE` file and update this section.
+Released under the **MIT License** (see `LICENSE`).
+
+This repository provides a Blender add-on only. Any external tools/datasets (e.g., COLMAP) remain under their own licenses.
 
 ---
 
@@ -495,7 +483,7 @@ If you use RS Studio in academic work, please cite it:
 @misc{rsstudio,
   title        = {RealSynth Dataset Studio (RS Studio)},
   author       = {Yunxiao Zhang},
-  year         = {2025},
+  year         = {2026},
   howpublished = {GitHub repository},
 }
 ```
