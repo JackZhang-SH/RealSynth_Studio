@@ -6,7 +6,7 @@
 RS Studio is a **Blender add-on for dataset generation and camera virtualization**.  
 It supports importing or generating multi-view camera rigs, rendering multi-frame datasets, and exporting data in formats commonly used by **COLMAP / NeRF / Instant-NGP / 3D Gaussian Splatting (3DGS)** pipelines, including **COLMAP-format 3DGS datasets with mesh-sampled ground-truth point clouds**.
 
-If you’re looking for the research context (TACV ecosystem), jump to: **[Research Context](#research-context-optional)**.
+If you’re looking for the research context (TACV ecosystem), jump to: **[Research Context](#research-context)**.
 
 Below is a quick UI pointer and screenshot.
 
