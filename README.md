@@ -455,7 +455,7 @@ RS Studio is part of the TACV ecosystem (**paper under revision at CVIU; preprin
 RS Studio focuses on dataset generation/export; TACV/TA-3DGS provide downstream reconstruction and evaluation.
 
 - **TACV (method + dataset format definition)**  
-  Repo: https://github.com/JackZhang-SH/Time-Archival-Camera-Virtualization-for-Visual-Performance-and-Sports
+  Repo: https://github.com/JackZhang-SH/Time-Archival-Camera-Virtualization-for-Sports-and-Visual-Performance
 - **TA-3DGS (3DGS training/eval pipeline aligned with TACV)**  
   Repo: https://github.com/JackZhang-SH/TimeArchival3DGS
 
